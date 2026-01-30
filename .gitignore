@@ -1,9 +1,10 @@
 
-/corpora
+/corpora_fr
 /corpora_en
 *.o
 /dev
 corpus.txt
-corpus_M.txt
+corpus_2M.txt
+corpus_4M.txt
 corpus_4.txt
 

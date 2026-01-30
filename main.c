@@ -8,12 +8,13 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 #define NUM_THREADS 8
 #define MAX_LINE_LEN 4096
 #define WORD_MAX_LEN 128
-#define MAX_WORDS_PER_GENERATION 180
-#define MAX_CANDIDATES 40
+#define MAX_WORDS_PER_GENERATION 500
+#define MAX_CANDIDATES 20
 #define HASH_TABLE_SIZE (1 << 21)
 #define STARTER_TABLE_SIZE (1 << 17)
 #define INTERN_TABLE_SIZE (1 << 20)
@@ -143,6 +144,9 @@ SynEntry syn_table[MAX_SYN_ENTRIES];
 int syn_count = 0;
 long total_starters = 0;
 long vocab_size = 0;
+
+int MIN_GEN_LEN = 12;
+int MAX_GEN_LEN = 28;
 
 atomic_long total_lines_processed = 0;
 long total_lines_global = 0;
@@ -808,98 +812,180 @@ static const char *choose_biased(Next *list, const char **keywords, int kw_count
     return NULL;
 }
 
-static int generate_sequence(const char *seed_input, const char **keywords, int kw_count, const char **out_words, int max_tokens) {
-
+static int generate_sequence(const char **keywords,
+                             int kw_count,
+                             const char **out_words,
+                             int max_tokens)
+{
     const char *prev[4] = {NULL};
     int generated = 0;
 
-    if (seed_input && *seed_input) {
-
-        char tmp[MAX_LINE_LEN];
-        strncpy(tmp, seed_input, sizeof(tmp)-1);
-        tmp[sizeof(tmp)-1] = '\0';
-
-        const char *toks[4] = {NULL};
-        int c = 0;
-        char *tok = strtok(tmp, " ");
-        while (tok && c < 4) {
-            toks[c++] = intern(tok);
-            fflush(stdout);
-            tok = strtok(NULL, " ");
-        }
-
-        if (c >= 1) prev[0] = toks[c-1];
-        if (c >= 2) prev[1] = toks[c-2];
-        if (c >= 3) prev[2] = toks[c-3];
-        if (c >= 4) prev[3] = toks[c-4];
-
-    }
-
-    if (!prev[0] && total_starters > 0) {
-
+    if (total_starters > 0) {
         long r = rand() % total_starters;
         long sum = 0;
-        int starter_found = 0;
 
-        for (int i = 0; i < STARTER_TABLE_SIZE && !starter_found; i++) {
+        for (int i = 0; i < STARTER_TABLE_SIZE; i++) {
             for (Starter *s = starter_table[i]; s; s = s->next) {
                 sum += s->count;
                 if (r < sum) {
                     prev[0] = s->word;
-                    starter_found = 1;
-                    goto seed_found;
+                    goto starter_found;
                 }
             }
         }
     }
-seed_found:;
+    prev[0] = intern("hello");
 
+starter_found:;
+
+    // push prev words into output
     for (int k = 3; k >= 0; k--) {
-        if (!prev[k]) continue;
-        out_words[generated++] = prev[k];
+        if (prev[k]) {
+            if (generated >= max_tokens) {
+                break;
+            }
+            out_words[generated++] = prev[k];
+        }
     }
 
-    while (generated < max_tokens) {
+    // -----------------------------
+    // Generate rest of sequence
+    // -----------------------------
+	while (generated < max_tokens) {
+		const char *candidates[4] = {0};
+		double cand_weights[4]   = {0};
+		double base_weights[4]   = {1.0, 0.7, 0.4, 0.2};
+		double total_w = 0.0;
 
-        const char *next = NULL;
+		for (int order = 4; order >= 1; order--) {
+		    if (generated < order)
+		        continue;
 
-        int found_context = 0;
-        for (int order = 4; order >= 1; order--) {
-            if (generated < order) {
-                continue;
-            }
+		    ContextKey ctx = {0};
+		    ctx.order = order;
+		    for (int k = 0; k < order; k++)
+		        ctx.w[k] = out_words[generated - 1 - k];
 
-            ContextKey ctx = {0};
-            ctx.order = order;
-            for (int k = 0; k < order; k++) {
-                ctx.w[k] = out_words[generated - 1 - k]; // newest first
-            }
+		    uint64_t h = hash_context(&ctx);
+		    size_t idx = h & (HASH_TABLE_SIZE - 1);
 
-            uint64_t h = hash_context(&ctx);
-            size_t idx = h & (HASH_TABLE_SIZE-1);
+		    for (Entry *e = hashtable[idx]; e; e = e->next) {
+		        if (context_equal(&e->key, &ctx)) {
 
-            for (Entry *e = hashtable[idx]; e; e = e->next) {
-                if (context_equal(&e->key, &ctx)) {
+		            const char *w = choose_biased(e->nexts, keywords, kw_count);
 
-                    next = choose_biased(e->nexts, keywords, kw_count);
+		            if (w) {
+		                int slot = 4 - order;
+		                candidates[slot] = w;
+		                double wgt = base_weights[slot];
+		                if (kw_count > 0 && order < 4)
+		                    wgt *= 1.2;
+		                cand_weights[slot] = wgt;
+		                total_w += wgt;
+		            }
+		            break;
+		        }
+		    }
+		}
 
-                    if (next) {
-                        found_context = 1;
-                        break;
-                    } 
-                }
-            }
+		// ===== Defensive fallback =====
+		const char *next = NULL;
+		if (total_w > 0.0) {
+		    double r = ((double)rand() / RAND_MAX) * total_w;
+		    double acc = 0.0;
+		    for (int i = 0; i < 4; i++) {
+		        if (!candidates[i]) continue;
+		        acc += cand_weights[i];
+		        if (r <= acc) {
+		            next = candidates[i];
+		            break;
+		        }
+		    }
+		}
 
-            if (found_context) break;
-        }
+		// if no next candidate, pick random starter
+		if (!next) {
+		    long r = rand() % total_starters;
+		    long sum = 0;
+		    for (int i = 0; i < STARTER_TABLE_SIZE; i++) {
+		        for (Starter *s = starter_table[i]; s; s = s->next) {
+		            sum += s->count;
+		            if (r < sum) {
+		                next = s->word;
+		                goto starter_chosen;
+		            }
+		        }
+		    }
+		    next = intern("hello");
+		}
 
-        if (!next) {
-            printf("[DEBUG-GEN] No next word found for any order → stopping at length %d\n", generated);
-            fflush(stdout);
-            break;
-        }
-        out_words[generated++] = next;
+	starter_chosen:
+		out_words[generated++] = next;
+	}
+
+
+    // -----------------------------
+    // POST-PROCESSING (COSMETIC)
+    // -----------------------------
+    if (generated == 0) {
+        printf("[DEBUG] generated == 0, returning 0\n");
+        return 0;
     }
+
+    // remove leading punctuation
+    int start = 0;
+    while (start < generated &&
+           ispunct((unsigned char)out_words[start][0]) &&
+           strcmp(out_words[start], ".") != 0){
+               start++;
+           }
+
+	int len = generated - start;
+
+	// Clamp length to min/max boundaries
+	if (len > MAX_GEN_LEN) len = MAX_GEN_LEN;
+	if (len < MIN_GEN_LEN) len = MIN_GEN_LEN;
+
+	// Optional: ensure final word is a period if possible
+	for (int i = len-1; i >= 0; i--) {
+		if (strcmp(out_words[start + i], ".") == 0) {
+		    len = i + 1;
+		    break;
+		}
+	}
+
+
+    for (int i = 0; i < len; i++)
+        out_words[i] = out_words[start + i];
+
+    generated = len;
+
+    // capitalization after '.'
+    bool cap = true;
+    for (int i = 0; i < generated; i++) {
+        const char *w = out_words[i];
+        if (!w) {
+            printf("[DEBUG] Warning: out_words[%d] is NULL\n", i);
+            continue;
+        }
+        if (cap && isalpha((unsigned char)w[0])) {
+            char buf[WORD_MAX_LEN];
+            strncpy(buf, w, sizeof(buf)-1);
+            buf[sizeof(buf)-1] = '\0';
+            buf[0] = toupper((unsigned char)buf[0]);
+            out_words[i] = intern(buf);
+            cap = false;
+        }
+        if (strcmp(w, ".") == 0)
+            cap = true;
+    }
+
+    // force final dot
+    if (generated > 0 && strcmp(out_words[generated - 1], ".") != 0)
+        out_words[generated++] = intern(".");
+    else if (generated == 0)
+        out_words[generated++] = intern(".");
+
     return generated;
 }
 
@@ -957,7 +1043,7 @@ void generate(FILE *out, const char *user_input) {
 
     for (int cand = 0; cand < MAX_CANDIDATES; cand++) {
         const char *words[MAX_WORDS_PER_GENERATION + 16] = {0};
-        int nw = generate_sequence(NULL, keywords, kw_count, words, MAX_WORDS_PER_GENERATION);
+        int nw = generate_sequence(keywords, kw_count, words, MAX_WORDS_PER_GENERATION);
 
         if (nw < 40) {
             continue;
@@ -1026,39 +1112,127 @@ void free_model(void) {
     }
 }
 
+static void parse_arguments(									// should be int return succes or 1
+    int argc,
+    char **argv,
+    const char **keywords,
+    int *kw_count
+) {
+    *kw_count = 0;
+
+    for (int i = 2; i < argc; i++) {
+        if (strncmp(argv[i], "keywords=", 9) == 0) {
+            char tmp[MAX_LINE_LEN];
+            strncpy(tmp, argv[i] + 9, sizeof(tmp) - 1); 		// snprintf() prevents buffer overflows and ensures null-termination,
+            tmp[sizeof(tmp) - 1] = '\0';
+
+            char *tok = strtok(tmp, ",");
+            while (tok && *kw_count < MAX_KEYWORDS) {
+                while (isspace(*tok)) tok++;
+
+                char *end = tok + strlen(tok) - 1;
+                while (end >= tok && isspace(*end)) {
+                    *end-- = '\0';
+                }
+
+                if (*tok) {
+                    keywords[(*kw_count)++] = intern(tok);
+                }
+                tok = strtok(NULL, ",");
+            }
+
+        } else if (strncmp(argv[i], "min_length=", 11) == 0) {
+            MIN_GEN_LEN = atoi(argv[i] + 11); 					// atoi could be replace by strtol() safer and more robust
+
+        } else if (strncmp(argv[i], "max_length=", 11) == 0) {
+            MAX_GEN_LEN = atoi(argv[i] + 11);					// atoi could be replace by strtol() safer and more robust
+        }
+    }
+}
+
+static int find_best_candidate(
+    const char **keywords,
+    int kw_count,
+    const char **best_words_out
+) {
+    int best_len = 0;
+    double best_score = 1e15;
+
+    for (int cand = 0; cand < MAX_CANDIDATES; cand++) {
+        const char *words[MAX_WORDS_PER_GENERATION + 16] = {0};
+        int nw = generate_sequence(keywords, kw_count, words, MAX_WORDS_PER_GENERATION);
+
+        if (nw < MIN_GEN_LEN) continue;
+
+        int rep_count = 0;
+        for (int j = 2; j < nw - 1; j++) {
+            if (words[j] == words[j - 2] &&
+                words[j + 1] == words[j - 1]) {
+                rep_count++;
+            }
+        }
+
+        double rep_penalty = (rep_count > 4) ? 2.0 : 1.0;
+        double ppl = compute_perplexity(words, nw);
+        double score = (ppl * rep_penalty) / (1.0 + 0.5 * log(nw + 1));
+
+        if (score < best_score || (score == best_score && nw > best_len)) {
+            best_score = score;
+            best_len = nw;
+            for (int i = 0; i < nw; i++) {
+                best_words_out[i] = words[i];
+            }
+        }
+    }
+
+    return best_len;
+}
+
 int main(int argc, char **argv) {
     srand(time(NULL));
     arena_init();
 
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s corpus.txt\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr,
+            "Usage: %s corpus.txt [keywords=key1,key2] [min_length=XX] [max_length=XX]\n",
+            argv[0]
+        );
         return 1;
     }
 
-    printf("=== Keyword-Guided Markov Chain ===\n");
-    printf("Loading %s ...\n", argv[1]);
+    const char *filename = argv[1];
+    const char *keywords[MAX_KEYWORDS] = {0};
+    int kw_count = 0;
 
-	if (build_model_mt(argv[1]) != 0) {
-		fprintf(stderr, "Multi-threaded model build failed.\n");
-		free_model();
-		return 1;
-	}
+    parse_arguments(argc, argv, keywords, &kw_count);
+
+    printf("Parsed %d keyword(s):\n", kw_count);
+    for (int i = 0; i < kw_count; i++) {
+        printf("  [%d]: '%s'\n", i, keywords[i]);
+    }
+
+    printf("=== Keyword-Guided Markov Chain ===\n");
+    printf("Loading %s ...\n", filename);
+
+    if (build_model_mt(filename) != 0) {
+        fprintf(stderr, "Multi-threaded model build failed.\n");
+        free_model();
+        return 1;
+    }
 
     load_synonyms("synonyms.txt");
 
-    printf("\nEnter keywords (comma separated) or just Enter for random:\n\n> ");
-    char line[MAX_LINE_LEN];
-    while (fgets(line, sizeof(line), stdin)) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
-        while (len > 0 && isspace((unsigned char)line[len-1])) line[--len] = '\0';
+    const char *best_words[MAX_WORDS_PER_GENERATION + 16] = {0};
+    int best_len = find_best_candidate(keywords, kw_count, best_words);
+
+    if (best_len > 0) {
+        print_words_properly(stdout, best_words, best_len);
         printf("\n");
-        generate(stdout, len ? line : NULL);
-        printf("\n\n> ");
-        fflush(stdout);
     }
 
-    printf("\nCleaning up...\n");
     free_model();
     return 0;
 }
+
+
+
