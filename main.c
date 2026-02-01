@@ -258,7 +258,14 @@ static void select_and_print_best(void) { // very naive for now
     putchar('\n');
 }
 
-void merge_local_into_global(Entry **local, Entry **global) { // TODO check for overflow, put boundaries
+void merge_local_into_global(Entry **local, Entry **global) {
+    // Temporary per-bucket hint: points to most recently matched/inserted entry in this bucket
+    Entry **hints = calloc(g_app.hashtable_size, sizeof(Entry *));
+    if (!hints) {
+        fprintf(stderr, "calloc failed for merge hints\n");
+        // You could fall back to original behavior or exit — for now just continue without hints
+    }
+
     struct TempMapping {
         Entry *local_entry;
         Entry *global_match;
@@ -268,6 +275,7 @@ void merge_local_into_global(Entry **local, Entry **global) { // TODO check for 
     size_t map_count = 0;
     size_t map_cap = 0;
 
+    // First pass: find matches or insert new entries
     for (size_t i = 0; i < g_app.hashtable_size; i++) {
         Entry *e = local[i];
         while (e) {
@@ -276,37 +284,55 @@ void merge_local_into_global(Entry **local, Entry **global) { // TODO check for 
             uint64_t h = hash_context(&e->key);
             size_t bucket = h % g_app.hashtable_size;
 
-            Entry *g = global[bucket];
             Entry *match = NULL;
 
-            while (g) {
-                if (context_equal(&g->key, &e->key)) {
-                    match = g;
-                    break;
+            // 1. Fast path: check the most recent match/insert in this bucket
+            if (hints && hints[bucket]) {
+                if (context_equal(&hints[bucket]->key, &e->key)) {
+                    match = hints[bucket];
                 }
-                g = g->next;
             }
 
+            // 2. Full scan only if hint missed or no hint yet
+            if (!match) {
+                Entry *g = global[bucket];
+                while (g) {
+                    if (context_equal(&g->key, &e->key)) {
+                        match = g;
+                        if (hints) hints[bucket] = g;  // update hint
+                        break;
+                    }
+                    g = g->next;
+                }
+            }
+
+            // Remember this local → global mapping (for second pass)
             if (map_count >= map_cap) {
                 map_cap = map_cap ? map_cap * 2 : 65536;
-                mappings = realloc(mappings, map_cap * sizeof(*mappings));
-                if (!mappings) {
-                    perror("realloc failed");
-                    exit(1);
+                struct TempMapping *new_map = realloc(mappings, map_cap * sizeof(*mappings));
+                if (!new_map) {
+                    fprintf(stderr, "realloc failed in merge\n");
+                    // TODO: proper cleanup and fallback
+                    free(mappings);
+                    free(hints);
+                    return;
                 }
+                mappings = new_map;
             }
-
             mappings[map_count++] = (struct TempMapping){e, match};
 
+            // 3. If no match → insert this local entry into global chain
             if (!match) {
                 e->next = global[bucket];
                 global[bucket] = e;
+                if (hints) hints[bucket] = e;  // new entry becomes the best hint
             }
 
             e = next_e;
         }
     }
 
+    // Second pass: merge the Next* lists only for entries that had a match
     for (size_t i = 0; i < map_count; i++) {
         Entry *local_e = mappings[i].local_entry;
         Entry *global_e = mappings[i].global_match;
@@ -322,7 +348,7 @@ void merge_local_into_global(Entry **local, Entry **global) { // TODO check for 
             bool found = false;
 
             while (gn) {
-                if (gn->word == ln->word) {
+                if (gn->word == ln->word) {           // pointer identity — fast
                     gn->count += ln->count;
                     global_e->total_count += ln->count;
                     free_next(ln);
@@ -341,10 +367,13 @@ void merge_local_into_global(Entry **local, Entry **global) { // TODO check for 
 
             ln = next_ln;
         }
+
+        // We don't need the local Entry struct anymore
         free_entry(local_e);
     }
 
     free(mappings);
+    free(hints);
 }
 
 void merge_starters(Starter **local, Starter **global) {
@@ -1382,7 +1411,7 @@ int main(int argc, char **argv) {
 		display_candidates();
 	}
 		
-	select_and_print_best();
+		select_and_print_best();
 
 shutdown:
 	free_model();

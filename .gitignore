@@ -1,10 +1,18 @@
 
 /corpora_fr
 /corpora_en
+/corpora
 *.o
 /dev
 corpus.txt
 corpus_2M.txt
 corpus_4M.txt
 corpus_4.txt
+merge.c
+./merge
+./temp
+temp.c
+merge
+temp
+
 
