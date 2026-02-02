@@ -19,20 +19,17 @@
 #define HASH_TABLE_SIZE (1 << 21)
 #define STARTER_TABLE_SIZE (1 << 17)
 #define INTERN_TABLE_SIZE (1 << 20)
-#define ARENA_BLOCK_SIZE (1ULL << 24)
+#define ARENA_BLOCK_SIZE (1ULL << 22)
 #define CONTEXT_BUF_SIZE 1024
 #define MAX_KEYWORDS 8
 #define MAX_SYNONYMS_PER_WORD 32
 #define MAX_SYN_ENTRIES 8192
 
-#define DEFAULT_MIN_TEXT_LENGTH 50
-#define DEFAULT_MAX_TEXT_LENGTH 60
+#define DEFAULT_MIN_TEXT_LENGTH 50 			// Safety if argument missing
+#define DEFAULT_MAX_TEXT_LENGTH 60			// Safety if argument missing
 #define HASH_TABLE_SIZE (1 << 21)
 
-// TODO Forward declaration mess as to be fixed
 typedef struct App App;
-static int  app_init(void);
-static void print_words_properly(FILE *out, const char **words, int count);
 
 typedef struct {
     const char **words;
@@ -52,29 +49,6 @@ typedef struct ArenaBlock {
     size_t used;
     char data[ARENA_BLOCK_SIZE];
 } ArenaBlock;
-
-ArenaBlock *arena_head = NULL;
-ArenaBlock *arena_current = NULL;
-
-void arena_init(void) {
-    arena_head = calloc(1, sizeof(ArenaBlock));
-    if (!arena_head) {
-        fprintf(stderr, "arena_init failed\n");
-        exit(1);
-    }
-    arena_current = arena_head;
-}
-
-char *arena_alloc(size_t size) {
-    if (arena_current->used + size + 1 > ARENA_BLOCK_SIZE) {
-        ArenaBlock *new_block = calloc(1, sizeof(ArenaBlock));
-        arena_current->next = new_block;
-        arena_current = new_block;
-    }
-    char *p = arena_current->data + arena_current->used;
-    arena_current->used += size + 1;
-    return p;
-}
 
 typedef struct InternEntry {
     const char *str;
@@ -117,12 +91,124 @@ typedef struct {
     ArenaBlock *local_arena;
 } ThreadData;
 
-Next *next_freelist = NULL;
+typedef struct {
+    const char *word;
+    long count;          // original frequency (for weighted random selection)
+} ThematicStarter;
+
+typedef struct App {
+    // ─────────────────────────────────────────────────────────────
+    //  1. Configuration & Command-line / runtime parameters
+    // ─────────────────────────────────────────────────────────────
+    char          *input_file;          // main training corpus
+    char          *output_file;         // (currently unused?)
+    char          *syn_file;            // synonyms file path (default: synonyms.txt)
+
+    int            min_gen_len;
+    int            max_gen_len;
+    int            max_candidates;
+
+    int            num_threads;
+    unsigned int   seed;
+    int            verbose;             // 0 = silent, 1 = info, 2 = debug, ...
+
+    // ─────────────────────────────────────────────────────────────
+    //  2. Keyword / Theme filtering
+    // ─────────────────────────────────────────────────────────────
+    const char   **keywords;            // array of original keywords (interned)
+    int            keyword_count;
+
+    const char    *keyword_syn_pool[2048];  // flattened pool of keywords + synonyms
+    int            keyword_syn_pool_count;
+
+    ThematicStarter *thematic_starters;     // precomputed weighted thematic starters
+    int             thematic_starter_count;
+    long            total_thematic_weight;
+
+    // ─────────────────────────────────────────────────────────────
+    //  3. Repetition & generation quality control
+    // ─────────────────────────────────────────────────────────────
+    int            rep_window;          // how far back to check for repetition
+    double         rep_penalty;         // multiplier when repetition is detected (e.g. 0.3)
+
+    // ─────────────────────────────────────────────────────────────
+    //  4. Model tables & sizes
+    // ─────────────────────────────────────────────────────────────
+    Entry        **hashtable;           // main n-gram → successors table
+    size_t         hashtable_size;
+
+    Starter      **starter_table;       // first-word frequency table
+    size_t         starter_table_size;
+
+    InternEntry  **intern_table;        // string interning hash table
+    size_t         intern_table_size;
+
+    long           vocab_size;          // approximate number of unique tokens
+    long           total_starters;      // total count of first-word occurrences
+
+    atomic_long    total_lines_processed;  // progress tracking across threads
+
+    // ─────────────────────────────────────────────────────────────
+    //  5. Candidate generation state
+    // ─────────────────────────────────────────────────────────────
+    Candidate      candidates[MAX_CANDIDATES];
+    int            candidate_count;
+    int            best_candidate_index;
+    double         best_score;
+    int            generation_attempts;
+
+    // ─────────────────────────────────────────────────────────────
+    //  6. Memory management – arena allocator
+    // ─────────────────────────────────────────────────────────────
+    ArenaBlock    *arena_head;          // first block in chain
+    ArenaBlock    *arena_current;       // block we're currently allocating from
+
+    // Optional / debug statistics (not yet implemented)
+    size_t         arena_total_bytes_used;
+    size_t         arena_block_count;
+
+    // ─────────────────────────────────────────────────────────────
+    //  7. Custom object pools (freelists) & allocation stats
+    // ─────────────────────────────────────────────────────────────
+    Entry         *entry_freelist;
+    Next          *next_freelist;
+
+    // Optional counters (very useful when debugging leaks / performance)
+    long           entry_alloc_count;
+    long           next_alloc_count;
+    long           entry_from_freelist;
+    long           next_from_freelist;
+
+} App;
+
+static App g_app;
+
+void display_global_debug(void);
+static int  app_init(void);
+static void print_words_properly(FILE *out, const char **words, int count);
+static int generate_sequence(const char **out_words);
+static inline bool context_equal(const ContextKey *a, const ContextKey *b);
+static inline uint64_t hash_context(const ContextKey *c);
+static void generate_multiple_candidates(void);
+void display_candidates(void);
+static double score_candidate(const char **words, int nw);
+void precompute_thematic_starters(void);
+static inline unsigned long hash_str(const char *str);
+const char *intern(const char *s);
+int split_into_words(char *line, const char **tokens_out, int max_tokens);
+static void select_and_print_best(void);
+bool is_in_syn_pool(const char *interned_str);
+void arena_init(void);
+char *arena_alloc(size_t size);
+Next *alloc_next(void);
+void free_next(Next *n);
+Entry *alloc_entry(void);
+void free_entry(Entry *e);
 
 Next *alloc_next(void) {
-    if (next_freelist) {
-        Next *n = next_freelist;
-        next_freelist = n->next;
+    if (g_app.next_freelist) {
+        Next *n = g_app.next_freelist;
+        g_app.next_freelist = n->next;
         memset(n, 0, sizeof(Next));
         return n;
     }
@@ -131,16 +217,14 @@ Next *alloc_next(void) {
 
 void free_next(Next *n) {
     if (!n) return;
-    n->next = next_freelist;
-    next_freelist = n;
+    n->next = g_app.next_freelist;
+    g_app.next_freelist = n;
 }
 
-Entry *entry_freelist = NULL;
-
 Entry *alloc_entry(void) {
-    if (entry_freelist) {
-        Entry *e = entry_freelist;
-        entry_freelist = e->next;
+    if (g_app.entry_freelist) {
+        Entry *e = g_app.entry_freelist;
+        g_app.entry_freelist = e->next;
         memset(e, 0, sizeof(Entry));
         return e;
     }
@@ -149,98 +233,38 @@ Entry *alloc_entry(void) {
 
 void free_entry(Entry *e) {
     if (!e) return;
-    e->next = entry_freelist;
-    entry_freelist = e;
+    e->next = g_app.entry_freelist;
+    g_app.entry_freelist = e;
 }
 
-typedef struct {
-    const char *word;
-    long count;          // original frequency (for weighted random selection)
-} ThematicStarter;
+void arena_init(void) {
+    if (g_app.arena_head) {
+        // already initialized → optional: you can warn or just return
+        return;
+    }
 
-typedef struct App {
+    ArenaBlock *block = calloc(1, sizeof(ArenaBlock));
+    if (!block) {
+        fprintf(stderr, "arena_init: calloc failed\n");
+        exit(1);
+    }
 
-    /* config */
-    char *input_file;
-    char *output_file;
-    char *syn_file;
-    int min_gen_len;
-    int max_gen_len;
-    int max_candidates;
-    int num_threads;
-    unsigned int seed;
-    int verbose;
-    
-    /* filters */
-    const char **keywords;
-    int keyword_count;
-    
-    /* model */
-    Entry **hashtable;
-    size_t hashtable_size;         // ← must be size_t
-    size_t starter_table_size;
-    Starter **starter_table;
-    long vocab_size;
-    long total_starters;
-    long intern_table_size;
-    
-    /* synonyms */
-	const char *keyword_syn_pool[2048]; // 2048 enough for now
-	int keyword_syn_pool_count;
-	
-	/* Starters */
-	ThematicStarter *thematic_starters;
-    int thematic_starter_count;
-    long total_thematic_weight;
-    
-    /* Reptition control */
-    int rep_window;
-    double rep_penalty;
-    
-    /* Generation candidates */
-    Candidate   candidates[MAX_CANDIDATES];
-    int         candidate_count;
-    int         best_candidate_index;
-    int generation_attempts;
-    double best_score;
-    
-    /* memory */
-    ArenaBlock arena;
-} App;
+    g_app.arena_head    = block;
+    g_app.arena_current = block;
+    // arena_total_bytes_used = 0;   // Not tracked anymore
+    // arena_block_count = 1;
+}
 
-static App g_app;
-
-// TODO clean big declaration mess 
-
-void display_global_debug(void);
-
-static const double lambda[5] = {0.0, 0.15, 0.35, 0.60, 0.85};
-InternEntry *intern_table[INTERN_TABLE_SIZE] = {0};
-Entry *hashtable[HASH_TABLE_SIZE] = {0};
-Starter *starter_table[STARTER_TABLE_SIZE] = {0};
-SynEntry syn_table[MAX_SYN_ENTRIES];
-static int generate_sequence(const char **out_words);
-int syn_count = 0;
-long total_starters = 0;
-long vocab_size = 0;
-
-int MIN_GEN_LEN = 12;
-int MAX_GEN_LEN = 28;
-
-atomic_long total_lines_processed = 0;
-long total_lines_global = 0;
-static inline bool context_equal(const ContextKey *a, const ContextKey *b);
-static inline uint64_t hash_context(const ContextKey *c);
-static void generate_multiple_candidates(void);
-void display_candidates(void);
-static double score_candidate(const char **words, int nw);
-void precompute_thematic_starters(void);
-
-static inline unsigned long hash_str(const char *str);
-const char *intern(const char *s);
-int split_into_words(char *line, const char **tokens_out, int max_tokens);
-static void select_and_print_best(void);
-bool is_in_syn_pool(const char *interned_str);
+char *arena_alloc(size_t size) {
+    if (g_app.arena_current->used + size + 1 > ARENA_BLOCK_SIZE) {
+        ArenaBlock *new_block = calloc(1, sizeof(ArenaBlock));
+        g_app.arena_current->next = new_block;
+        g_app.arena_current = new_block;
+    }
+    char *p = g_app.arena_current->data + g_app.arena_current->used;
+    g_app.arena_current->used += size + 1;
+    return p;
+}
 
 static void select_and_print_best(void) { // very naive for now
     if (g_app.candidate_count == 0) {
@@ -570,7 +594,7 @@ void *process_chunk(void *arg) {
 
     while (fgets(line, sizeof(line), f)) {
         // Increment global line counter immediately
-        atomic_fetch_add(&total_lines_processed, 1);
+        atomic_fetch_add(&g_app.total_lines_processed, 1);
         local_lines++;
 
         size_t line_len = strlen(line);
@@ -610,7 +634,7 @@ void *process_chunk(void *arg) {
         }
 
 		if (g_app.verbose >= 1) {
-			long global_processed = atomic_load(&total_lines_processed);
+			long global_processed = atomic_load(&g_app.total_lines_processed);
 			static long last_reported = 0;
 			
 			if (global_processed - last_reported >= 10000) {
@@ -630,6 +654,8 @@ void *process_chunk(void *arg) {
 }
 
 int build_model_mt(void){
+
+	memset(g_app.intern_table, 0,g_app.intern_table_size * sizeof(InternEntry*));
 
     const char *filename = g_app.input_file;
     if (!filename || !*filename) {
@@ -683,8 +709,8 @@ int build_model_mt(void){
     g_app.total_starters = 0;
 
     // Reset arena head/current if needed (or we could keep chaining, but for simplicity reset)
-    arena_head    = NULL;
-    arena_current = NULL;
+    g_app.arena_head    = NULL;
+    g_app.arena_current = NULL;
     arena_init();  // Re-init global arena (creates first block)
 
     pthread_t threads[NUM_THREADS];
@@ -722,7 +748,7 @@ int build_model_mt(void){
         pthread_join(threads[t], NULL);
     }
     
-	long final_processed = atomic_load(&total_lines_processed);
+	long final_processed = atomic_load(&g_app.total_lines_processed);
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
     double read_parse_time = (ts_end.tv_sec - ts_start.tv_sec) + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
 
@@ -751,14 +777,14 @@ int build_model_mt(void){
         ArenaBlock *b = td[t].local_arena;
         while (b) {
             ArenaBlock *next_b = b->next;
-            if (!arena_head) {
-                arena_head = b;
-                arena_current = b;
-                arena_current->next = NULL;
+            if (!g_app.arena_head) {
+                g_app.arena_head = b;
+                g_app.arena_current = b;
+                g_app.arena_current->next = NULL;
             } else {
-                arena_current->next = b;
-                arena_current = b;
-                arena_current->next = NULL;
+                g_app.arena_current->next = b;
+                g_app.arena_current = b;
+                g_app.arena_current->next = NULL;
             }
             b = next_b;
         }
@@ -833,7 +859,7 @@ const char *intern(const char *s) {
     if (!s || !*s) return "";
     size_t len = strlen(s);
     unsigned long h = hash_str(s) % g_app.intern_table_size;
-    InternEntry *e = intern_table[h];
+    InternEntry *e = g_app.intern_table[h];
     while (e) {
         if (strcmp(e->str, s) == 0) return e->str;
         e = e->next;
@@ -843,8 +869,8 @@ const char *intern(const char *s) {
     copy[len] = '\0';
     InternEntry *new_e = malloc(sizeof(InternEntry));
     new_e->str = copy;
-    new_e->next = intern_table[h];
-    intern_table[h] = new_e;
+    new_e->next = g_app.intern_table[h];
+    g_app.intern_table[h] = new_e;
     return copy;
 }
 
@@ -983,26 +1009,6 @@ int split_into_words(char *line, const char **tokens_out, int max_tokens) {
         tokens_out[count++] = intern(tmp);
     }
     return count;
-}
-
-void add_starter(const char *word) {
-    if (!word || !*word) return;
-    unsigned long h = hash_str(word) % g_app.starter_table_size;
-    Starter *s = starter_table[h];
-    while (s) {
-        if (s->word == word) {
-            s->count++;
-            total_starters++;
-            return;
-        }
-        s = s->next;
-    }
-    Starter *new_s = malloc(sizeof(Starter));
-    new_s->word = word;
-    new_s->count = 1;
-    new_s->next = starter_table[h];
-    starter_table[h] = new_s;
-    total_starters++;
 }
 
 // Computes perplexity of a sequence (single function, log-domain, efficient smoothing)
@@ -1172,10 +1178,8 @@ static int generate_sequence(const char **out_words)
             uint64_t h = hash_context(&ctx);
             size_t idx = h & (g_app.hashtable_size - 1);
 
-            //bool found = false;
             for (Entry *e = g_app.hashtable[idx]; e; e = e->next) {
                 if (context_equal(&e->key, &ctx)) {
-                    //found = true;
 
                     // Pick the most frequent next word
                     const char *best_next = NULL;
@@ -1394,62 +1398,130 @@ static void print_words_properly(FILE *out, const char **words, int count) {
     }
 }
 
-void free_model(void) {
-    // Free global hashtable
-    for (size_t i = 0; i < g_app.hashtable_size; i++) {
-        Entry *e = g_app.hashtable[i];
-        while (e) {
-            Entry *ne = e->next;
-            Next *n = e->nexts;
-            while (n) {
-                Next *nn = n->next;
-                free_next(n);
-                n = nn;
+void free_model(void)
+{
+    // ─────────────────────────────────────────────────────────────
+    //  1. Free model data structures (hashtable + transitions)
+    // ─────────────────────────────────────────────────────────────
+    if (g_app.hashtable) {
+        for (size_t i = 0; i < g_app.hashtable_size; i++) {
+            Entry *e = g_app.hashtable[i];
+            while (e) {
+                Entry *next_entry = e->next;
+
+                // Free the Next chain (successor words)
+                Next *n = e->nexts;
+                while (n) {
+                    Next *next_n = n->next;
+                    free_next(n);           // uses g_app.next_freelist
+                    n = next_n;
+                }
+
+                free_entry(e);              // uses g_app.entry_freelist
+                e = next_entry;
             }
-            free_entry(e);
-            e = ne;
         }
+        free(g_app.hashtable);
+        g_app.hashtable = NULL;
     }
 
-    // Free starter table
-    for (size_t i = 0; i < g_app.starter_table_size; i++) {
-        Starter *s = g_app.starter_table[i];
-        while (s) {
-            Starter *ns = s->next;
-            free(s);
-            s = ns;
+    // ─────────────────────────────────────────────────────────────
+    //  2. Free starter table
+    // ─────────────────────────────────────────────────────────────
+    if (g_app.starter_table) {
+        for (size_t i = 0; i < g_app.starter_table_size; i++) {
+            Starter *s = g_app.starter_table[i];
+            while (s) {
+                Starter *next_s = s->next;
+                free(s);
+                s = next_s;
+            }
         }
+        free(g_app.starter_table);
+        g_app.starter_table = NULL;
     }
 
-    // Free intern table
-    for (int i = 0; i < g_app.intern_table_size; i++) {
-        InternEntry *e = intern_table[i];
-        while (e) {
-            InternEntry *ne = e->next;
-            free(e);
-            e = ne;
+    // ─────────────────────────────────────────────────────────────
+    //  3. Free string interning table
+    // ─────────────────────────────────────────────────────────────
+    if (g_app.intern_table) {
+        for (size_t i = 0; i < g_app.intern_table_size; i++) {
+            InternEntry *e = g_app.intern_table[i];
+            while (e) {
+                InternEntry *next_e = e->next;
+                free(e);
+                e = next_e;
+            }
         }
+        free(g_app.intern_table);
+        g_app.intern_table = NULL;
     }
 
-    // Free arena blocks
-    ArenaBlock *b = arena_head;
-    while (b) {
-        ArenaBlock *nb = b->next;
-        free(b);
-        b = nb;
+    // ─────────────────────────────────────────────────────────────
+    //  4. Free the arena (all string copies live here)
+    // ─────────────────────────────────────────────────────────────
+    ArenaBlock *block = g_app.arena_head;
+    while (block) {
+        ArenaBlock *next_block = block->next;
+        free(block);
+        block = next_block;
     }
+    g_app.arena_head    = NULL;
+    g_app.arena_current = NULL;
 
-    // free all stored candidates
+    // ─────────────────────────────────────────────────────────────
+    //  5. Free candidate storage
+    // ─────────────────────────────────────────────────────────────
     for (int i = 0; i < g_app.candidate_count; i++) {
         free(g_app.candidates[i].words);
         g_app.candidates[i].words = NULL;
     }
     g_app.candidate_count = 0;
+    g_app.best_candidate_index = -1;
+    g_app.best_score = 0.0;
+    g_app.generation_attempts = 0;
 
-    g_app.hashtable = NULL;
-    g_app.starter_table = NULL;
-    arena_head = NULL;
-    arena_current = NULL;
+    // ─────────────────────────────────────────────────────────────
+    //  6. Free keyword-related dynamic arrays
+    // ─────────────────────────────────────────────────────────────
+    if (g_app.keywords) {
+        free(g_app.keywords);
+        g_app.keywords = NULL;
+    }
+    g_app.keyword_count = 0;
+
+    if (g_app.thematic_starters) {
+        free(g_app.thematic_starters);
+        g_app.thematic_starters = NULL;
+    }
+    g_app.thematic_starter_count = 0;
+    g_app.total_thematic_weight = 0;
+
+    // ─────────────────────────────────────────────────────────────
+    //  7. Clean up freelists (return nodes to system)
+    // ─────────────────────────────────────────────────────────────
+    while (g_app.entry_freelist) {
+        Entry *e = g_app.entry_freelist;
+        g_app.entry_freelist = e->next;
+        free(e);
+    }
+    g_app.entry_freelist = NULL;
+
+    while (g_app.next_freelist) {
+        Next *n = g_app.next_freelist;
+        g_app.next_freelist = n->next;
+        free(n);
+    }
+    g_app.next_freelist = NULL;
+
+    // ─────────────────────────────────────────────────────────────
+    //  8. Reset model statistics
+    // ─────────────────────────────────────────────────────────────
+    g_app.vocab_size     = 0;
+    g_app.total_starters = 0;
+
+    // Optional: if you want to be very explicit
+    // memset(&g_app.candidates, 0, sizeof(g_app.candidates));
 }
 
 static int parse_arguments(int argc, char **argv) {
@@ -1704,35 +1776,105 @@ void display_candidates(void) {
 /* app lifecycle                                      */
 /* -------------------------------------------------- */
 
-static int app_init(void) {
+static int app_init(void)
+{
+    // 1. Zero out the entire struct first (safest starting point)
     memset(&g_app, 0, sizeof(g_app));
-    g_app.input_file = NULL;
+
+    // ─────────────────────────────────────────────────────────────
+    //  Config / Files
+    // ─────────────────────────────────────────────────────────────
+    g_app.input_file  = NULL;
     g_app.output_file = NULL;
-    g_app.syn_file = "synonyms.txt";
-    g_app.min_gen_len = DEFAULT_MIN_TEXT_LENGTH;
-    g_app.max_gen_len = DEFAULT_MAX_TEXT_LENGTH;
-    g_app.max_candidates = MAX_CANDIDATES;
+    g_app.syn_file    = "synonyms.txt";           // default value
+
+    // ─────────────────────────────────────────────────────────────
+    //  Generation parameters
+    // ─────────────────────────────────────────────────────────────
+    g_app.min_gen_len     = DEFAULT_MIN_TEXT_LENGTH;
+    g_app.max_gen_len     = DEFAULT_MAX_TEXT_LENGTH;
+    g_app.max_candidates  = MAX_CANDIDATES;
+    g_app.rep_window      = 5;
+    g_app.rep_penalty     = 0.3;
+
+    // ─────────────────────────────────────────────────────────────
+    //  Threading & performance
+    // ─────────────────────────────────────────────────────────────
     g_app.num_threads = NUM_THREADS;
-    g_app.seed = (unsigned)time(NULL);
-    g_app.verbose = 1; // info level
-    g_app.keyword_count = 0;
-    g_app.keywords = NULL;
-    g_app.hashtable_size = HASH_TABLE_SIZE; 
-    g_app.starter_table_size = STARTER_TABLE_SIZE;
-    g_app.intern_table_size = INTERN_TABLE_SIZE;
-    g_app.vocab_size = 0;
-    g_app.total_starters = 0;
-    g_app.best_score = 0;
-    g_app.generation_attempts = 0;
-    g_app.keyword_syn_pool_count = 0;
-    g_app.rep_window = 5;
-	g_app.rep_penalty = 0.3;
-    memset(g_app.keyword_syn_pool, 0, sizeof(g_app.keyword_syn_pool));
+
+    // ─────────────────────────────────────────────────────────────
+    //  Randomness & logging
+    // ─────────────────────────────────────────────────────────────
+    g_app.seed    = (unsigned)time(NULL);
+    g_app.verbose = 1;                    // default: info level
+
     srand(g_app.seed);
+
+    // ─────────────────────────────────────────────────────────────
+    //  Keyword / Theme filtering
+    // ─────────────────────────────────────────────────────────────
+    g_app.keyword_count        = 0;
+    g_app.keywords             = NULL;                    // will be allocated later if needed
+    g_app.keyword_syn_pool_count = 0;
+    memset(g_app.keyword_syn_pool, 0, sizeof(g_app.keyword_syn_pool));
+
+    // ─────────────────────────────────────────────────────────────
+    //  Model table sizes (power-of-2 preferred for fast modulo)
+    // ─────────────────────────────────────────────────────────────
+    g_app.hashtable_size     = HASH_TABLE_SIZE;       // 1<<21 = ~2M buckets
+    g_app.starter_table_size = STARTER_TABLE_SIZE;    // 1<<17 = 131072
+    g_app.intern_table_size  = INTERN_TABLE_SIZE;     // 1<<20 = ~1M buckets
+
+    // ─────────────────────────────────────────────────────────────
+    //  Model state & statistics
+    // ─────────────────────────────────────────────────────────────
+    g_app.hashtable       = NULL;                     // allocated in build_model_mt
+    g_app.starter_table   = NULL;                     // allocated in build_model_mt
+    g_app.intern_table    = NULL;                     // ← we allocate it here now
+    g_app.vocab_size      = 0;
+    g_app.total_starters  = 0;
+
+    // ─────────────────────────────────────────────────────────────
+    //  Candidate generation state
+    // ─────────────────────────────────────────────────────────────
+    g_app.candidate_count       = 0;
+    g_app.best_candidate_index  = -1;
+    g_app.best_score            = 0.0;
+    g_app.generation_attempts   = 0;
     memset(g_app.candidates, 0, sizeof(g_app.candidates));
-	g_app.candidate_count = 0;
-	g_app.best_candidate_index = -1;
-    arena_init();
+
+    // ─────────────────────────────────────────────────────────────
+    //  Memory management (arena)
+    // ─────────────────────────────────────────────────────────────
+    g_app.arena_head    = NULL;
+    g_app.arena_current = NULL;
+    arena_init();           // creates the first block
+    
+    // Custom freelists for Entry and Next nodes
+	g_app.entry_freelist = NULL;
+	g_app.next_freelist  = NULL;
+
+	// Optional: reset counters if you track them
+	g_app.entry_alloc_count       = 0;
+	g_app.next_alloc_count        = 0;
+	g_app.entry_from_freelist     = 0;
+	g_app.next_from_freelist      = 0;
+
+    // ─────────────────────────────────────────────────────────────
+    //  Allocate the interning hash table (double pointer style)
+    // ─────────────────────────────────────────────────────────────
+    g_app.intern_table = calloc(g_app.intern_table_size, sizeof(InternEntry *));
+    if (!g_app.intern_table) {
+        fprintf(stderr, "app_init: failed to allocate intern_table (%zu entries)\n",
+                g_app.intern_table_size);
+        return -1;
+    }
+
+    // Optional: if you want to be extra paranoid during development
+    // for (size_t i = 0; i < g_app.intern_table_size; i++) {
+    //     g_app.intern_table[i] = NULL;
+    // }
+
     return 0;
 }
 
@@ -1864,8 +2006,8 @@ void display_global_debug(void) {
     printf("\n");
 
     printf("--- Memory Arena ---\n");
-    printf("  head       : %p\n", (void *)arena_head);
-    printf("  current    : %p\n", (void *)arena_current);
+    printf("  head       : %p\n", (void *)g_app.arena_head);
+    printf("  current    : %p\n", (void *)g_app.arena_current);
     printf("  block_size : %zu\n", (size_t)ARENA_BLOCK_SIZE);
     printf("\n");
     
