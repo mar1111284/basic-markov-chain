@@ -15,7 +15,7 @@
 #define MAX_LINE_LEN 4096
 #define WORD_MAX_LEN 128
 #define MAX_WORDS_PER_GENERATION 500
-#define MAX_CANDIDATES 10
+#define MAX_CANDIDATES 400
 #define HASH_TABLE_SIZE (1 << 21)
 #define STARTER_TABLE_SIZE (1 << 17)
 #define INTERN_TABLE_SIZE (1 << 20)
@@ -153,6 +153,11 @@ void free_entry(Entry *e) {
     entry_freelist = e;
 }
 
+typedef struct {
+    const char *word;
+    long count;          // original frequency (for weighted random selection)
+} ThematicStarter;
+
 typedef struct App {
 
     /* config */
@@ -172,21 +177,32 @@ typedef struct App {
     
     /* model */
     Entry **hashtable;
-    long hashtable_size;
+    size_t hashtable_size;         // ← must be size_t
+    size_t starter_table_size;
     Starter **starter_table;
-    long starter_table_size;
     long vocab_size;
     long total_starters;
     long intern_table_size;
     
     /* synonyms */
-    SynEntry syn_table[MAX_SYN_ENTRIES];
-    int syn_count;
+	const char *keyword_syn_pool[2048]; // 2048 enough for now
+	int keyword_syn_pool_count;
+	
+	/* Starters */
+	ThematicStarter *thematic_starters;
+    int thematic_starter_count;
+    long total_thematic_weight;
+    
+    /* Reptition control */
+    int rep_window;
+    double rep_penalty;
     
     /* Generation candidates */
     Candidate   candidates[MAX_CANDIDATES];
     int         candidate_count;
     int         best_candidate_index;
+    int generation_attempts;
+    double best_score;
     
     /* memory */
     ArenaBlock arena;
@@ -218,15 +234,17 @@ static inline uint64_t hash_context(const ContextKey *c);
 static void generate_multiple_candidates(void);
 void display_candidates(void);
 static double score_candidate(const char **words, int nw);
+void precompute_thematic_starters(void);
 
 static inline unsigned long hash_str(const char *str);
 const char *intern(const char *s);
 int split_into_words(char *line, const char **tokens_out, int max_tokens);
 static void select_and_print_best(void);
+bool is_in_syn_pool(const char *interned_str);
 
 static void select_and_print_best(void) { // very naive for now
     if (g_app.candidate_count == 0) {
-        printf("No valid candidates generated.\n");
+        printf("[CRITICAL] No valid candidates generated.\n");
         return;
     }
 
@@ -245,14 +263,12 @@ static void select_and_print_best(void) { // very naive for now
     }
 
     if (best_idx < 0) {
-        printf("No best candidate found.\n");
+        printf("[CRITICAL] No best candidate found.\n");
         return;
     }
 
     Candidate *winner = &g_app.candidates[best_idx];
-
-    printf("\nBest candidate selected (index %d, length %d, score %.4f):\n\n",
-           best_idx + 1, winner->length, best_score);
+    g_app.best_score = best_score;
 
     print_words_properly(stdout, winner->words, winner->length);
     putchar('\n');
@@ -593,22 +609,22 @@ void *process_chunk(void *arg) {
             window[0] = curr;
         }
 
-        // Progress reporting every 50k lines (adjust number if too noisy or too quiet)
-        if (local_lines % 50000 == 0 && g_app.verbose >= 1) {
-            long global_processed = atomic_load(&total_lines_processed);
-            fprintf(stderr, "[Thread %ld] Processed %ld lines so far (global: %ld)\n",
-                    (long)pthread_self(), local_lines, global_processed);
-            fflush(stderr);
-        }
+		if (g_app.verbose >= 1) {
+			long global_processed = atomic_load(&total_lines_processed);
+			static long last_reported = 0;
+			
+			if (global_processed - last_reported >= 10000) {
+				last_reported = global_processed;
+				double percent = (double)global_processed / 318786 * 100.0;
+				if (percent > 100.0) percent = 100.0;
+				printf("\r\033[K%.1f%%", percent);
+				fflush(stdout);
+			}
+		}
     }
 
     fclose(f);
     free(seen);
-
-    if (g_app.verbose >= 1) {
-        fprintf(stderr, "[Thread %ld] Finished — processed %ld lines\n",
-                (long)pthread_self(), local_lines);
-    }
 
     return NULL;
 }
@@ -711,16 +727,17 @@ int build_model_mt(void){
     double read_parse_time = (ts_end.tv_sec - ts_start.tv_sec) + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
 
     if (g_app.verbose >= 1) {
-        printf("\nReading & parsing finished:\n");
+        printf("\n\nReading & parsing finished:\n");
         printf("  - Total lines processed: %ld\n", final_processed);
         printf("  - Time: %.2f seconds\n", read_parse_time);
+        printf("\n");
         fflush(stdout);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts_start); // reset time for mergin phase
 
     for (int t = 0; t < NUM_THREADS; t++) {
-        if (g_app.verbose >= 2) {
+        if (g_app.verbose >= 1) {
             printf("Merging thread %d local table...\n", t);
             fflush(stdout);
         }
@@ -831,43 +848,105 @@ const char *intern(const char *s) {
     return copy;
 }
 
-int load_synonyms(const char *filename) {
+int load_synonyms(void)
+{
+    const char *filename = g_app.syn_file ? g_app.syn_file : "synonyms.txt";
+
     FILE *f = fopen(filename, "r");
     if (!f) {
+        fprintf(stderr, "Cannot open synonyms file: %s\n", filename);
         return -1;
     }
-    int loaded_before = g_app.syn_count;
-    char line[4096];
-    while (fgets(line, sizeof(line), f)) {
-        line[strcspn(line, "\n")] = 0;
-        if (!*line || strlen(line) < 3)
-            continue;
-        char *head = strtok(line, ",");
-        if (!head || !*head)
-            continue;
-        if (g_app.syn_count >= MAX_SYN_ENTRIES)
-            break;
-        SynEntry *e = &g_app.syn_table[g_app.syn_count++];
-        e->word = intern(head);
-        e->num_syns = 0;
-        char *s;
-        while ((s = strtok(NULL, ","))) {
-            while (isspace(*s)) s++;
-            char *end = s + strlen(s) - 1;
-            while (end >= s && isspace(*end))
-                *end-- = '\0';
-            if (*s && e->num_syns < MAX_SYNONYMS_PER_WORD) {
-                e->syns[e->num_syns++] = intern(s);
-            }
+
+    g_app.keyword_syn_pool_count = 0;
+
+    int keywords_added = 0;
+    for (int i = 0; i < g_app.keyword_count; i++)
+    {
+        const char *kw = g_app.keywords[i];
+        if (!kw) continue;
+
+        bool dup = false;
+        for (int j = 0; j < g_app.keyword_syn_pool_count; j++)
+        {
+            if (g_app.keyword_syn_pool[j] == kw) { dup = true; break; }
         }
-        if (e->num_syns == 0) {
-            g_app.syn_count--;
+        if (!dup && g_app.keyword_syn_pool_count < 2048)
+        {
+            g_app.keyword_syn_pool[g_app.keyword_syn_pool_count++] = kw;
+            keywords_added++;
         }
     }
+
+    int groups_used = 0;
+    int synonyms_added = 0;
+
+    char line[8192];
+    while (fgets(line, sizeof(line), f))
+    {
+        line[strcspn(line, "\n")] = '\0';
+        if (strlen(line) < 3) continue;
+        char *words[128];
+        int word_count = 0;
+        char *token = strtok(line, ",");
+        while (token && word_count < 128)
+        {
+            while (isspace(*token)) token++;
+            char *end = token + strlen(token) - 1;
+            while (end >= token && isspace(*end)) *end-- = '\0';
+
+            if (*token)
+            {
+                words[word_count++] = token;
+            }
+            token = strtok(NULL, ",");
+        }
+
+        if (word_count == 0) continue;
+
+        bool relevant = false;
+        for (int w = 0; w < word_count && !relevant; w++)
+        {
+            const char *candidate = intern(words[w]);  // ensure interned
+
+            for (int k = 0; k < g_app.keyword_count; k++)
+            {
+                if (g_app.keywords[k] == candidate)
+                {
+                    relevant = true;
+                    break;
+                }
+            }
+        }
+
+        if (!relevant) continue;
+        groups_used++;
+        int local_added = 0;
+
+        for (int w = 0; w < word_count; w++)
+        {
+            const char *syn_interned = intern(words[w]);
+
+            bool dup = false;
+            for (int j = 0; j < g_app.keyword_syn_pool_count; j++)
+            {
+                if (g_app.keyword_syn_pool[j] == syn_interned)
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup && g_app.keyword_syn_pool_count < 2048)
+            {
+                g_app.keyword_syn_pool[g_app.keyword_syn_pool_count++] = syn_interned;
+                local_added++;
+                synonyms_added++;
+            }
+        }
+    }
+
     fclose(f);
-    if (g_app.syn_count == loaded_before)
-        return -2;
-    return 0;
+    return (g_app.keyword_syn_pool_count > 0) ? 0 : -2;
 }
 
 
@@ -926,159 +1005,146 @@ void add_starter(const char *word) {
     total_starters++;
 }
 
-double get_smoothed_prob(const char **prev_words, int prev_count, const char *word) {
-    if (!word) return 0.0;
-
-    double prob = 0.0;
-    double remaining_mass = 1.0;
-
-    int max_order = prev_count > 4 ? 4 : prev_count;
-    for (int ord = max_order; ord >= 1; ord--) {
-        if (remaining_mass <= 1e-9) break;
-
-        ContextKey ctx = {0};
-        ctx.order = (uint8_t)ord;
-        for (int i = 0; i < ord; i++) {
-            ctx.w[i] = prev_words[prev_count - 1 - i];
-        }
-
-        uint64_t h = hash_context(&ctx);
-        size_t bucket = h % g_app.hashtable_size;
-
-        long count = 0;
-        long observed = 0;
-
-        for (Entry *e = hashtable[bucket]; e; e = e->next) {
-            if (context_equal(&e->key, &ctx)) {
-                observed = e->total_count;
-                for (Next *n = e->nexts; n; n = n->next) {
-                    if (n->word == word) {
-                        count = n->count;
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-
-        double local_p = (observed > 0) ? (count + 0.01) / (observed + 0.01 * vocab_size): 0.0;
-        double w = lambda[ord] * remaining_mass;
-        prob += w * local_p;
-        remaining_mass -= w;
-    }
-
-    double uniform = 1.0 / vocab_size;
-    prob += remaining_mass * uniform;
-
-    return prob;
-}
-
-double compute_perplexity(const char **words, int nw) {
+// Computes perplexity of a sequence (single function, log-domain, efficient smoothing)
+static double compute_perplexity(const char **words, int nw)
+{
     if (nw < 2) return 1e12;
 
     double log_sum = 0.0;
-    int transitions = 0;
+    int valid_count = 0;
 
-    for (int i = 1; i < nw; i++) {
-        int prev_count = (i >= 4) ? 4 : i;
-        double p = get_smoothed_prob(&words[i - prev_count], prev_count, words[i]);
+    // Fixed interpolation weights (sum should be ≈1, tune if needed)
+    static const double lambdas[5] = {0.0, 0.15, 0.25, 0.35, 0.25}; // order 0→4
 
-        if (p <= 0) p = 1e-10;
-        log_sum += log(p);
-        transitions++;
-    }
+    // Small constant for Lidstone smoothing
+    const double alpha = 0.01;
 
-    if (transitions == 0) return 1e12;
+    for (int pos = 1; pos < nw; pos++) {
+        int ctx_len = pos < 4 ? pos : 4;  // use up to 4-gram
 
-    double avg_nll = -log_sum / transitions;
-    return exp(avg_nll);
-}
+        double prob = 0.0;
+        double remaining = 1.0;
 
-static const char *choose_biased(Next *list, const char **keywords, int kw_count) {
-    if (!list) return NULL;
-    if (kw_count <= 0) return NULL;
+        // Backoff from highest to lowest order
+        for (int ord = ctx_len; ord >= 1; ord--) {
+            if (remaining < 1e-9) break;
 
-    typedef struct { const char *word; double score; } Scored;
-    Scored scored[256];
-    int scount = 0;
-    long total_raw = 0;
-
-    for (Next *n = list; n; n = n->next) {
-        if (!n->word) continue;
-        total_raw += n->count;
-    }
-    if (total_raw == 0) return NULL;
-
-    for (Next *n = list; n; n = n->next) {
-        if (!n->word) continue;
-        double base_p = (double)n->count / total_raw;
-        double boost = 1.0;
-
-        for (int k = 0; k < kw_count; k++) {
-            const char *target = keywords[k];
-            if (n->word == target) {
-                boost *= 3.0;
-                goto boosted;
+            // Build context
+            ContextKey ctx = {0};
+            ctx.order = (uint8_t)ord;
+            for (int k = 0; k < ord; k++) {
+                ctx.w[k] = words[pos - 1 - k];
             }
-            for (int s = 0; s < syn_count; s++) {
-                if (syn_table[s].word == target) {
-                    for (int i = 0; i < syn_table[s].num_syns; i++) {
-                        if (n->word == syn_table[s].syns[i]) {
-                            boost *= 2.5;
-                            goto boosted;
+
+            uint64_t h = hash_context(&ctx);
+            size_t bucket = h & (g_app.hashtable_size - 1);
+
+            long observed = 0;
+            long match_count = 0;
+
+            // Lookup
+            for (Entry *e = g_app.hashtable[bucket]; e; e = e->next) {
+                if (context_equal(&e->key, &ctx)) {
+                    observed = e->total_count;
+                    for (Next *n = e->nexts; n; n = n->next) {
+                        if (n->word == words[pos]) {
+                            match_count = n->count;
+                            break;
                         }
                     }
+                    break;
+                }
+            }
+
+            // Lidstone smoothing
+            double denom = observed + alpha * g_app.vocab_size;
+            double p = (observed > 0) ? (match_count + alpha) / denom : alpha / denom;
+
+            // Interpolate
+            double w = lambdas[ord] * remaining;
+            prob += w * p;
+            remaining -= w;
+        }
+
+        // Remaining mass → uniform
+        double uniform_p = 1.0 / (g_app.vocab_size + 10000.0); // slightly boosted
+        prob += remaining * uniform_p;
+
+        // Accumulate log-prob
+        if (prob > 0) {
+            log_sum += log(prob);
+            valid_count++;
+        }
+    }
+
+    if (valid_count == 0) return 1e12;
+
+    double avg_log_p = log_sum / valid_count;
+    double ppl = exp(-avg_log_p);
+
+    return ppl;
+}
+
+bool is_keyword_related(const char *w) // Linear search could be slow 
+{
+    if (!w) {
+        return false;
+    }
+
+    for (int i = 0; i < g_app.keyword_syn_pool_count; i++) {
+        if (g_app.keyword_syn_pool[i] == w) {   // pointer equality
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Selects a starter word, preferring one from keyword_syn_pool if possible
+static const char *select_thematic_starter(void)
+{
+    // Prefer thematic if we have any
+    if (g_app.thematic_starter_count > 0 && g_app.total_thematic_weight > 0) {
+        long r = rand() % g_app.total_thematic_weight;
+        long sum = 0;
+
+        for (int i = 0; i < g_app.thematic_starter_count; i++) {
+            sum += g_app.thematic_starters[i].count;
+            if (r < sum) {
+                const char *chosen = g_app.thematic_starters[i].word;
+                return chosen;
+            }
+        }
+    }
+
+    // Fallback to original full weighted random
+    if (g_app.total_starters > 0) {
+        long r = rand() % g_app.total_starters;
+        long sum = 0;
+        for (size_t i = 0; i < g_app.starter_table_size; i++) {
+            for (Starter *s = g_app.starter_table[i]; s; s = s->next) {
+                sum += s->count;
+                if (r < sum) {
+                    return s->word;
                 }
             }
         }
-    boosted:
-        if (scount < 256) {
-            scored[scount++] = (Scored){n->word, base_p * boost};
-        }
     }
 
-    double total_boosted = 0;
-    for (int i = 0; i < scount; i++) total_boosted += scored[i].score;
-    if (total_boosted <= 0) return NULL;
-
-    double r = ((double)rand() / RAND_MAX) * total_boosted;
-    double sum = 0;
-    for (int i = 0; i < scount; i++) {
-        sum += scored[i].score;
-        if (r < sum) return scored[i].word;
-    }
-    return NULL;
+    // Ultimate fallback
+    return intern("hello");
 }
 
 static int generate_sequence(const char **out_words)
 {
-    const char **keywords  = g_app.keywords;
-    int kw_count           = g_app.keyword_count;
-    int max_tokens         = MAX_WORDS_PER_GENERATION;   // safety cap ? 
-
+    int max_tokens = MAX_WORDS_PER_GENERATION; // safety cap
     const char *prev[4] = {NULL};
     int generated = 0;
 
     // Select starter
-    if (g_app.total_starters > 0) {
-        long r = rand() % g_app.total_starters;
-        long sum = 0;
-        for (int i = 0; i < g_app.starter_table_size; i++) {
-            for (Starter *s = g_app.starter_table[i]; s; s = s->next) {
-                sum += s->count;
-                if (r < sum) {
-                    prev[0] = s->word;
-                    goto starter_found;
-                }
-            }
-        }
-    }
+    prev[0] = select_thematic_starter();
 
-    prev[0] = intern("hello");
-
-starter_found:;
-
-    // Push initial context (up to 4 words)
+    // Push initial context (up to 4 words) kept for future multi-word starters
     for (int k = 3; k >= 0; k--) {
         if (prev[k]) {
             if (generated >= max_tokens) break;
@@ -1088,10 +1154,11 @@ starter_found:;
 
     // Main generation loop
     while (generated < max_tokens) {
-        const char *candidates[4] = {NULL};
-        double cand_weights[4]    = {0.0};
-        double base_weights[4]    = {1.0, 0.7, 0.4, 0.2};
-        double total_w = 0.0;
+        const char *candidates[4] = {NULL};           // slot 0 = order 4, slot 1 = order 3, ...
+        double cand_weights[4] = {0.0};               // only used in fallback case
+
+        bool has_syn_candidate = false;
+        int best_syn_slot = -1;                       // lowest slot = highest order
 
         for (int order = 4; order >= 1; order--) {
             if (generated < order) continue;
@@ -1105,72 +1172,148 @@ starter_found:;
             uint64_t h = hash_context(&ctx);
             size_t idx = h & (g_app.hashtable_size - 1);
 
+            //bool found = false;
             for (Entry *e = g_app.hashtable[idx]; e; e = e->next) {
                 if (context_equal(&e->key, &ctx)) {
-                    const char *w = choose_biased(e->nexts, keywords, kw_count);
-                    if (w) {
-                        int slot = 4 - order;
-                        candidates[slot] = w;
-                        double wgt = base_weights[slot];
-                        if (kw_count > 0 && order < 4) wgt *= 1.2;
-                        cand_weights[slot] = wgt;
-                        total_w += wgt;
-                    }
-                    break;
-                }
-            }
-        }
+                    //found = true;
 
-        const char *next = NULL;
-
-        if (total_w > 0.0) {
-            double r = ((double)rand() / RAND_MAX) * total_w;
-            double acc = 0.0;
-            for (int i = 0; i < 4; i++) {
-                if (!candidates[i]) continue;
-                acc += cand_weights[i];
-                if (r <= acc) {
-                    next = candidates[i];
-                    break;
-                }
-            }
-        }
-
-        if (!next) {
-            if (g_app.total_starters > 0) {
-                long r = rand() % g_app.total_starters;
-                long sum = 0;
-                for (int i = 0; i < g_app.starter_table_size; i++) {
-                    for (Starter *s = g_app.starter_table[i]; s; s = s->next) {
-                        sum += s->count;
-                        if (r < sum) {
-                            next = s->word;
-                            goto starter_chosen;
+                    // Pick the most frequent next word
+                    const char *best_next = NULL;
+                    long max_count = -1;
+                    for (Next *n = e->nexts; n; n = n->next) {
+                        if (n->count > max_count) {
+                            max_count = n->count;
+                            best_next = n->word;
                         }
                     }
+
+                    if (best_next) {
+                        int slot = 4 - order;
+                        candidates[slot] = best_next;
+
+                        // Check if this candidate is in the synonym pool
+                        if (is_keyword_related(best_next)) {
+                            has_syn_candidate = true;
+                            if (best_syn_slot == -1 || slot < best_syn_slot) {
+                                best_syn_slot = slot;
+                            }
+                        }
+                    }
+                    break;
                 }
             }
-            next = intern("hello");
         }
+
+		// ────────────────────────────────────────────────
+		// Decide next word
+		// ────────────────────────────────────────────────
+		const char *next = NULL;
+
+		// Priority 1: probabilistic synonym preference
+		bool use_syn_priority = false;
+		if (has_syn_candidate && best_syn_slot != -1) {
+			use_syn_priority = (rand() % 100 < 70);  // adjust 70 as needed
+		}
+
+		if (use_syn_priority) {
+			next = candidates[best_syn_slot];
+		}
+
+		// Priority 2: Jelinek-Mercer weighted random + repetition penalty
+		if (!next) {
+			double base_weights[4] = {0.9, 0.7, 0.4, 0.2};
+			double total_w = 0.0;
+
+			for (int slot = 0; slot < 4; slot++) {
+				if (candidates[slot]) {
+				    double wgt = base_weights[slot];
+
+				    // REPETITION PENALTY: reduce weight if candidate was used recently
+				    bool is_recent = false;
+				    for (int k = 1; k <= g_app.rep_window && generated - k >= 0; k++) {
+				        if (out_words[generated - k] == candidates[slot]) {
+				            is_recent = true;
+				            break;
+				        }
+				    }
+				    if (is_recent) {
+				        wgt *= g_app.rep_penalty;  // e.g. 0.3 = strong penalty
+				    }
+
+				    total_w += wgt;
+				}
+			}
+
+			if (total_w > 0.0) {
+				double r = ((double)rand() / RAND_MAX) * total_w;
+				double acc = 0.0;
+				for (int slot = 0; slot < 4; slot++) {
+				    if (candidates[slot]) {
+				        double wgt = base_weights[slot];
+
+				        // Re-apply penalty for consistency in accumulation
+				        bool is_recent = false;
+				        for (int k = 1; k <= g_app.rep_window && generated - k >= 0; k++) {
+				            if (out_words[generated - k] == candidates[slot]) {
+				                is_recent = true;
+				                break;
+				            }
+				        }
+				        if (is_recent) wgt *= g_app.rep_penalty;
+
+				        acc += wgt;
+				        if (r <= acc) {
+				            next = candidates[slot];
+				            break;
+				        }
+				    }
+				}
+			}
+		}
+
+		// Ultimate fallback (unchanged)
+		if (!next) {
+			if (g_app.total_starters > 0) {
+				long r = rand() % g_app.total_starters;
+				long sum = 0;
+				for (size_t i = 0; i < g_app.starter_table_size; i++) {
+				    for (Starter *s = g_app.starter_table[i]; s; s = s->next) {
+				        sum += s->count;
+				        if (r < sum) {
+				            next = s->word;
+				            goto starter_chosen;
+				        }
+				    }
+				}
+			}
+			next = intern("hello");
+		}
 
     starter_chosen:
         if (next == NULL) {
-            next = intern(".");  // ultimate safety ?
+            next = intern(".");
         }
 
         out_words[generated++] = next;
+        
+        // Early stopping: stop if we reached max length
+		if (generated >= g_app.max_gen_len) {
+			break;
+		}
 
-        // Early stopping: once min length reached, stop at first sentence ender
+        // Early stopping if we reach end of phrase after min_gen_len
         if (generated >= g_app.min_gen_len) {
             if (strcmp(next, ".") == 0 ||
                 strcmp(next, "!") == 0 ||
                 strcmp(next, "?") == 0) {
-                break;  // natural sentence end → stop here
+                break;
             }
         }
     }
 
-    // Post-processing remains unchanged for now
+    // ────────────────────────────────────────────────
+    // Post-processing (unchanged)
+    // ────────────────────────────────────────────────
     if (generated == 0) {
         return 0;
     }
@@ -1182,14 +1325,13 @@ starter_found:;
            strcmp(out_words[start], ".") != 0) {
         start++;
     }
-
     int len = generated - start;
 
-    // Clamp length to min/max boundaries (still useful as final guard)
+    // Clamp length
     if (len > g_app.max_gen_len) len = g_app.max_gen_len;
     if (len < g_app.min_gen_len) len = g_app.min_gen_len;
 
-    // Optional: trim to last period if possible
+    // Trim to last period if possible
     for (int i = len - 1; i >= 0; i--) {
         if (strcmp(out_words[start + i], ".") == 0) {
             len = i + 1;
@@ -1197,12 +1339,12 @@ starter_found:;
         }
     }
 
+    // Shift back
     for (int i = 0; i < len; i++)
         out_words[i] = out_words[start + i];
-
     generated = len;
 
-    // capitalization after '.'
+    // Capitalization after '.'
     bool cap = true;
     for (int i = 0; i < generated; i++) {
         const char *w = out_words[i];
@@ -1219,7 +1361,7 @@ starter_found:;
             cap = true;
     }
 
-    // force final dot
+    // Force final dot
     if (generated > 0 && strcmp(out_words[generated - 1], ".") != 0)
         out_words[generated++] = intern(".");
     else if (generated == 0)
@@ -1254,7 +1396,7 @@ static void print_words_properly(FILE *out, const char **words, int count) {
 
 void free_model(void) {
     // Free global hashtable
-    for (int i = 0; i < g_app.hashtable_size; i++) {
+    for (size_t i = 0; i < g_app.hashtable_size; i++) {
         Entry *e = g_app.hashtable[i];
         while (e) {
             Entry *ne = e->next;
@@ -1270,7 +1412,7 @@ void free_model(void) {
     }
 
     // Free starter table
-    for (int i = 0; i < g_app.starter_table_size; i++) {
+    for (size_t i = 0; i < g_app.starter_table_size; i++) {
         Starter *s = g_app.starter_table[i];
         while (s) {
             Starter *ns = s->next;
@@ -1389,9 +1531,9 @@ int main(int argc, char **argv) {
 	if (parse_arguments(argc, argv) != 0)
 		goto shutdown;
 		
-	if (load_synonyms(g_app.syn_file) < 0)
+	if (load_synonyms() < 0)
 		fprintf(stderr, "Warning: synonyms disabled\n");
-		    
+	
 	if (build_model_mt() != 0) {
 		fprintf(stderr, "Model build failed\n");
 		goto shutdown;
@@ -1403,46 +1545,113 @@ int main(int argc, char **argv) {
 	if (g_app.total_starters == 0) {
 		fprintf(stderr, "WARNING: no starter words → generation will fallback to 'hello'\n");
 	}
+	
+	precompute_thematic_starters();
     
     generate_multiple_candidates();
 
 	if (g_app.verbose >= 1) {
 		display_global_debug();
-		display_candidates();
+		//display_candidates(); No need for now
 	}
 		
-		select_and_print_best();
+	select_and_print_best();
+	
 
 shutdown:
-	free_model();
+	//free_model();
 	return 0;
 }
 
-static double score_candidate(const char **words, int nw) {
-    if (nw < 2) return 1e15;  // very bad
+static double score_candidate(const char **words, int nw)
+{
+    if (nw < g_app.min_gen_len) return 1e15;  // too short = very bad
 
-    int rep_count = 0;
-    for (int j = 2; j < nw - 1; j++) {
-        if (words[j] == words[j - 2] && words[j + 1] == words[j - 1]) {
-            rep_count++;
+    // ────────────────────────────────────────────────
+    // 1. Theme / synonym density (biggest factor)
+    // ────────────────────────────────────────────────
+    int theme_count = 0;
+    int exact_keyword_count = 0;
+
+    for (int i = 0; i < nw; i++) {
+        if (is_keyword_related(words[i])) {
+            theme_count++;
+            // Extra bonus for exact keyword match
+            for (int k = 0; k < g_app.keyword_count; k++) {
+                if (words[i] == g_app.keywords[k]) {
+                    exact_keyword_count++;
+                    break;
+                }
+            }
         }
     }
 
-    double rep_penalty = (rep_count > 4) ? 2.0 : 1.0;
-    double ppl = compute_perplexity(words, nw);
-    double length_bonus = 1.0 + 0.5 * log(nw + 1.0);
+    double theme_ratio = (double)theme_count / nw;
+	double theme_score = 30.0 * (1.0 - theme_ratio);  // was 10 or 20 — now 30 or even 50
+    double exact_bonus = exact_keyword_count * 0.5;           // reward exact keywords
 
-    return (ppl * rep_penalty) / length_bonus;
+    // ────────────────────────────────────────────────
+    // 2. Repetition penalty (local + global)
+    // ────────────────────────────────────────────────
+    int local_rep = 0;
+    for (int j = 2; j < nw; j++) {
+        // Simple bigram alternation penalty
+        if (words[j] == words[j-2] && words[j-1] == words[j+1]) {
+            local_rep++;
+        }
+    }
+
+    // Global repetition: count how many times the same trigram appears
+    int global_rep = 0;
+    for (int i = 0; i < nw - 2; i++) {
+        for (int j = i + 3; j < nw - 2; j++) {
+            if (words[i] == words[j] && words[i+1] == words[j+1] && words[i+2] == words[j+2]) {
+                global_rep++;
+            }
+        }
+    }
+
+    double rep_penalty = 1.0 + 0.5 * local_rep + 1.0 * global_rep;
+
+    // ────────────────────────────────────────────────
+    // 3. Perplexity (fluency under Markov model)
+    // ────────────────────────────────────────────────
+    double ppl = compute_perplexity(words, nw);
+
+    // ────────────────────────────────────────────────
+    // 4. Length reward (encourage good length)
+    // ────────────────────────────────────────────────
+    double ideal_len = (g_app.min_gen_len + g_app.max_gen_len) / 2.0;
+    double len_diff = fabs(nw - ideal_len);
+    double len_reward = 1.0 + 0.8 * exp(-len_diff / 5.0);  // Gaussian-like around ideal
+
+    // Bonus if ends with sentence punctuation
+    double end_bonus = 0.0;
+    if (nw > 0) {
+        const char *last = words[nw-1];
+        if (strcmp(last, ".") == 0 || strcmp(last, "!") == 0 || strcmp(last, "?") == 0) {
+            end_bonus = 0.7;
+        }
+    }
+
+    // ────────────────────────────────────────────────
+    // Final composite score (lower = better)
+    // ────────────────────────────────────────────────
+    double final_score = 
+        (ppl * rep_penalty * theme_score) /          // bad fluency + rep + low theme → high score
+        (len_reward + end_bonus + exact_bonus + 0.1); // good length + ending + exact keywords → low score
+
+    return final_score;
 }
 
 static void generate_multiple_candidates(void) {
     g_app.candidate_count = 0;
-
-    int attempts = 0;
+    g_app.generation_attempts = 0;
+    
     const int max_attempts = g_app.max_candidates * 10; // while boundary 
 
-    while (g_app.candidate_count < g_app.max_candidates && attempts < max_attempts) {
-        attempts++;
+    while (g_app.candidate_count < g_app.max_candidates && g_app.generation_attempts < max_attempts) {
+        g_app.generation_attempts++;
 
         const char *words[MAX_WORDS_PER_GENERATION + 16] = {0};
         int nw = generate_sequence(words);
@@ -1459,18 +1668,12 @@ static void generate_multiple_candidates(void) {
 
             if (g_app.verbose >= 2) {
                 printf("Valid candidate #%d added (length %d after %d attempts)\n",
-                       g_app.candidate_count, nw, attempts);
+                       g_app.candidate_count, nw, g_app.generation_attempts);
             }
         }
     }
 
-    if (g_app.verbose >= 1) {
-        printf("\n[INFO] Finished generation: %d valid candidates collected "
-               "(after %d total attempts, target was %d)\n",
-               g_app.candidate_count, attempts, g_app.max_candidates);
-    }
-
-    if (g_app.candidate_count == 0 && attempts >= max_attempts) {
+    if (g_app.candidate_count == 0 && g_app.generation_attempts >= max_attempts) {
         fprintf(stderr, "Warning: Could not generate any valid candidates "
                         "in %d attempts (min=%d, max=%d)\n",
                         max_attempts, g_app.min_gen_len, g_app.max_gen_len);
@@ -1519,7 +1722,12 @@ static int app_init(void) {
     g_app.intern_table_size = INTERN_TABLE_SIZE;
     g_app.vocab_size = 0;
     g_app.total_starters = 0;
-    g_app.syn_count = 0;
+    g_app.best_score = 0;
+    g_app.generation_attempts = 0;
+    g_app.keyword_syn_pool_count = 0;
+    g_app.rep_window = 5;
+	g_app.rep_penalty = 0.3;
+    memset(g_app.keyword_syn_pool, 0, sizeof(g_app.keyword_syn_pool));
     srand(g_app.seed);
     memset(g_app.candidates, 0, sizeof(g_app.candidates));
 	g_app.candidate_count = 0;
@@ -1529,54 +1737,207 @@ static int app_init(void) {
 }
 
 void display_global_debug(void) {
-    printf("\nApp Debug Dump:\n");
-    
-    printf("\n--- Config ---\n\n");
-    printf("input_file: %s\n", g_app.input_file ? g_app.input_file : "NULL");
-    printf("output_file: %s\n", g_app.output_file ? g_app.output_file : "NULL");
-    printf("syn_file: %s\n", g_app.syn_file ? g_app.syn_file : "NULL");
-    printf("min_gen_len: %d\n", g_app.min_gen_len);
-    printf("max_gen_len: %d\n", g_app.max_gen_len);
-    printf("max_candidates: %d\n", g_app.max_candidates);
-    printf("num_threads: %d\n", g_app.num_threads);
-    printf("seed: %u\n", g_app.seed);
-    printf("verbose: %d\n", g_app.verbose);
-    
-    printf("\n--- Filters ---\n\n");
-    printf("keyword_count: %d\n", g_app.keyword_count);
+    printf("\n\n=== App Global Debug Dump ===\n\n");
+
+    printf("--- Configuration ---\n");
+    printf("  input_file     : %s\n", g_app.input_file     ? g_app.input_file     : "(null)");
+    printf("  output_file    : %s\n", g_app.output_file    ? g_app.output_file    : "(null)");
+    printf("  syn_file       : %s\n", g_app.syn_file       ? g_app.syn_file       : "(null)");
+    printf("  min_gen_len    : %d\n", g_app.min_gen_len);
+    printf("  max_gen_len    : %d\n", g_app.max_gen_len);
+    printf("  max_candidates : %d\n", g_app.max_candidates);
+    printf("  num_threads    : %d\n", g_app.num_threads);
+    printf("  seed           : %u\n", g_app.seed);
+    printf("  verbose        : %d\n", g_app.verbose);
+    printf("\n");
+
+    printf("--- Keyword Filters ---\n");
+    printf("  keyword_count  : %d\n", g_app.keyword_count);
     if (g_app.keyword_count > 0 && g_app.keywords) {
-        printf("keywords: ");
+        printf("  keywords       : ");
         for (int i = 0; i < g_app.keyword_count; i++) {
             printf("%s%s", g_app.keywords[i], (i < g_app.keyword_count - 1) ? ", " : "\n");
         }
     } else {
-        printf("keywords: (empty)\n");
+        printf("  keywords       : (none)\n");
     }
-    
-    printf("\n--- Model ---\n\n");
-    printf("hashtable: %p\n", (void *)g_app.hashtable);
-    printf("hashtable_size: %ld\n", g_app.hashtable_size);
-    printf("intern_table_size: %ld\n", g_app.intern_table_size);
-    printf("starter_table: %p\n", (void *)g_app.starter_table);
-    printf("starter_table_size: %p\n", (void *)g_app.starter_table_size);
-    printf("vocab_size: %ld\n", g_app.vocab_size);
-    printf("total_starters: %ld\n", g_app.total_starters);
-    
-	printf("\n--- Synonyms ---\n\n");
-    printf("syn_count: %d\n", g_app.syn_count);
-    if (g_app.syn_count > 0) {
-        int total_synonyms = 0;
-        for (int i = 0; i < 5; i++) { // for debug i just display the first 5 that's enough 
-            int ns = g_app.syn_table[i].num_syns;
-            total_synonyms += ns;
-            printf("  syn_table[%d]: word='%s', num_syns=%d\n", i, g_app.syn_table[i].word, ns);
-        }
-        printf("  ...\n");
-    } else {
-        printf("syn_table: (empty)\n");
-    }
-    
-    printf("\n--- Memory ---\n\n");
-    printf("arena: head=%p, current=%p, block_size=%zu\n", (void *)arena_head, (void *)arena_current, (size_t)ARENA_BLOCK_SIZE);
     printf("\n");
+
+    printf("--- Synonym / Theme Pool ---\n");
+    printf("  keyword_syn_pool_count : %d\n", g_app.keyword_syn_pool_count);
+
+    if (g_app.keyword_syn_pool_count > 0) {
+        // Count how many are original keywords (for breakdown)
+        int counted_keywords = 0;
+        for (int i = 0; i < g_app.keyword_syn_pool_count; i++) {
+            const char *w = g_app.keyword_syn_pool[i];
+            bool is_orig_keyword = false;
+            for (int k = 0; k < g_app.keyword_count; k++) {
+                if (w == g_app.keywords[k]) {
+                    is_orig_keyword = true;
+                    break;
+                }
+            }
+            if (is_orig_keyword) counted_keywords++;
+        }
+
+        int counted_synonyms = g_app.keyword_syn_pool_count - counted_keywords;
+
+        printf("    └─ original keywords : %d\n", counted_keywords);
+        printf("    └─ added from groups : %d\n", counted_synonyms);
+        printf("\n");
+
+        // Show full pool (or limit if too big)
+        const int MAX_SHOWN = 10;  // prevent flooding terminal
+        printf("  Pool content (%d total):\n", g_app.keyword_syn_pool_count);
+        for (int i = 0; i < g_app.keyword_syn_pool_count && i < MAX_SHOWN; i++) {
+            printf("    %s\n", g_app.keyword_syn_pool[i]);
+        }
+        if (g_app.keyword_syn_pool_count > MAX_SHOWN) {
+            printf("    ... (and %d more)\n", g_app.keyword_syn_pool_count - MAX_SHOWN);
+        }
+    } else {
+        printf("    (empty - no keywords or matching synonym groups loaded)\n");
+    }
+    printf("\n");
+    
+	// Thematic Starters (precomputed)
+	printf("--- Thematic Starters ---\n");
+	printf(" thematic_starter_count : %d\n", g_app.thematic_starter_count);
+	printf(" total_thematic_weight  : %ld\n", g_app.total_thematic_weight);
+
+	if (g_app.thematic_starter_count > 0 && g_app.thematic_starters) {
+		// Optional: count how many are original keywords
+		int counted_keywords = 0;
+		for (int i = 0; i < g_app.thematic_starter_count; i++) {
+		    const char *w = g_app.thematic_starters[i].word;
+		    bool is_orig = false;
+		    for (int k = 0; k < g_app.keyword_count; k++) {
+		        if (w == g_app.keywords[k]) {
+		            is_orig = true;
+		            break;
+		        }
+		    }
+		    if (is_orig) counted_keywords++;
+		}
+		int counted_extra = g_app.thematic_starter_count - counted_keywords;
+
+		printf(" └─ from original keywords : %d\n", counted_keywords);
+		printf(" └─ from synonym groups    : %d\n", counted_extra);
+		printf("\n");
+		
+		// sort by count
+		for (int i = 0; i < g_app.thematic_starter_count - 1; i++) {
+		    for (int j = 0; j < g_app.thematic_starter_count - i - 1; j++) {
+		        if (g_app.thematic_starters[j].count < g_app.thematic_starters[j+1].count) {
+		            ThematicStarter temp = g_app.thematic_starters[j];
+		            g_app.thematic_starters[j] = g_app.thematic_starters[j+1];
+		            g_app.thematic_starters[j+1] = temp;
+		        }
+		    }
+		}
+
+		// Show list (limited)
+		const int MAX_SHOWN = 10;
+		printf(" Thematic starters (%d total):\n", g_app.thematic_starter_count);
+		for (int i = 0; i < g_app.thematic_starter_count && i < MAX_SHOWN; i++) {
+		    printf("   %s (count: %ld)\n",
+		           g_app.thematic_starters[i].word,
+		           g_app.thematic_starters[i].count);
+		}
+		if (g_app.thematic_starter_count > MAX_SHOWN) {
+		    printf("   ... (and %d more)\n", g_app.thematic_starter_count - MAX_SHOWN);
+		}
+	} else {
+		printf(" (none - no matching starters in synonym pool)\n");
+	}
+	printf("\n");
+
+    printf("--- Model Stats ---\n");
+    printf("  hashtable         : %p\n", (void *)g_app.hashtable);
+    printf("  hashtable_size    : %zu\n", g_app.hashtable_size);   // use %zu for size_t
+    printf("  intern_table_size : %zu\n", g_app.intern_table_size);
+    printf("  starter_table     : %p\n", (void *)g_app.starter_table);
+    printf("  starter_table_size: %zu\n", g_app.starter_table_size);
+    printf("  vocab_size        : %zu\n", g_app.vocab_size);
+    printf("  total_starters    : %zu\n", g_app.total_starters);
+    printf("\n");
+
+    printf("--- Memory Arena ---\n");
+    printf("  head       : %p\n", (void *)arena_head);
+    printf("  current    : %p\n", (void *)arena_current);
+    printf("  block_size : %zu\n", (size_t)ARENA_BLOCK_SIZE);
+    printf("\n");
+    
+	printf("--- Candidates ---\n");
+	printf("  Attempts made:          %d\n", g_app.generation_attempts);
+	printf("  Valid candidates kept:  %d\n", g_app.candidate_count);
+	if (g_app.candidate_count > 0) {
+		printf("  Best score found:       %.4f\n", g_app.best_score);
+	} else {
+		printf("  (none generated - check corpus, keywords or parameters)\n");
+	}
+	printf("\n");
+
+    printf("\n=== End of debug dump ===\n\n");
+}
+
+bool is_in_syn_pool(const char *interned_str) {
+    for (int i = 0; i < g_app.keyword_syn_pool_count; i++) {
+        if (g_app.keyword_syn_pool[i] == interned_str) return true;
+    }
+    return false;
+}
+
+void precompute_thematic_starters(void)
+{
+    // Clear previous allocation if any (for safety / re-init)
+    if (g_app.thematic_starters) {
+        free(g_app.thematic_starters);
+        g_app.thematic_starters = NULL;
+    }
+
+    g_app.thematic_starter_count = 0;
+    g_app.total_thematic_weight = 0;
+
+    if (g_app.keyword_syn_pool_count == 0 || g_app.total_starters == 0) {
+        printf("[INFO] No thematic starters to precompute (empty pool or no starters).\n");
+        return;
+    }
+
+    // Pass 1: count + sum weights
+    for (size_t i = 0; i < g_app.starter_table_size; i++) {
+        for (Starter *s = g_app.starter_table[i]; s; s = s->next) {
+            if (is_keyword_related(s->word)) {
+                g_app.thematic_starter_count++;
+                g_app.total_thematic_weight += s->count;
+            }
+        }
+    }
+
+    if (g_app.thematic_starter_count == 0) {
+        printf("[INFO] No starters match the synonym pool.\n");
+        return;
+    }
+
+    // Allocate
+    g_app.thematic_starters = malloc(g_app.thematic_starter_count * sizeof(ThematicStarter));
+    if (!g_app.thematic_starters) {
+        fprintf(stderr, "[ERROR] Failed to allocate thematic starters array\n");
+        g_app.thematic_starter_count = 0;
+        g_app.total_thematic_weight = 0;
+        return;
+    }
+
+    // Pass 2: fill the array
+    int idx = 0;
+    for (size_t i = 0; i < g_app.starter_table_size; i++) {
+        for (Starter *s = g_app.starter_table[i]; s; s = s->next) {
+            if (is_keyword_related(s->word)) {
+                g_app.thematic_starters[idx].word = s->word;
+                g_app.thematic_starters[idx].count = s->count;
+                idx++;
+            }
+        }
+    }
 }
