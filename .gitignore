@@ -15,5 +15,6 @@ temp.c
 merge
 temp
 *.log
-
-
+README.md
+README.MD
+archive.txt

@@ -18,8 +18,8 @@
 // --- Text / Generation Limits ---
 #define MAX_LINE_LEN 4096
 #define WORD_MAX_LEN 128
-#define MAX_WORDS_PER_GENERATION 500
-#define MAX_CANDIDATES 400
+#define MAX_WORDS_PER_GENERATION 1000
+#define MAX_CANDIDATES 600
 
 // --- Tables / Hashing ---
 #define HASH_TABLE_SIZE (1 << 21)        // hash table for words
@@ -178,6 +178,9 @@ typedef struct App {
     // ------------------------------------------------------------
     int            rep_window;          // how far back to check for repetition
     double         rep_penalty;         // multiplier when repetition is detected (e.g. 0.3)
+    double         temperature;         // 0.0 = deterministic, 1.0 = original distribution, >1.0 = more random
+    double         average_theme_density;   // average over all accepted candidates
+    int            top_k;
 
     // ------------------------------------------------------------
     //  4. Model tables & sizes
@@ -205,6 +208,8 @@ typedef struct App {
     int            best_candidate_index;
     double         best_score;
     int            generation_attempts;
+    double 		   theme_force_probability;
+    double         min_theme_density;
 
     // ------------------------------------------------------------
     //  6. Memory management – arena allocator
@@ -231,6 +236,7 @@ typedef struct App {
 } App;
 
 static App g_app;
+static pthread_mutex_t intern_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ---------------------------
 // Debug / Display
@@ -275,7 +281,6 @@ static void generate_multiple_candidates(void);
 static double score_candidate(const char **words, int nw);
 static double compute_perplexity(const char **words, int nw);
 static void select_and_print_best(void); // naive for now
-
 // ---------------------------
 // Context / Hash utilities
 // ---------------------------
@@ -335,8 +340,14 @@ static int app_init(void)
     g_app.min_gen_len     = DEFAULT_MIN_TEXT_LENGTH;
     g_app.max_gen_len     = DEFAULT_MAX_TEXT_LENGTH;
     g_app.max_candidates  = MAX_CANDIDATES;
-    g_app.rep_window      = 5;
-    g_app.rep_penalty     = 0.3;
+	g_app.temperature = 1.3;
+	g_app.top_k = 10;
+	g_app.rep_penalty = 0.18;
+	g_app.rep_window              = 10;       // 8–16 is fine
+	g_app.theme_force_probability  = 0.8;     // lower = less forced jumps
+	g_app.average_theme_density = 0.0;
+	g_app.min_theme_density = 0.04;
+
 
     // ------------------------------------------------------------
     //  3. Threading & performance
@@ -544,6 +555,16 @@ void display_global_debug(void) {
     printf("  arena_total_bytes_used : %zu\n", g_app.arena_total_bytes_used);
     printf("  arena_block_count      : %zu\n", g_app.arena_block_count);
     printf("\n");
+    
+	// --- Generation filters & controls ---
+	printf("--- Generation Filters & Controls ---\n");
+	printf("  rep_window            : %d\n", g_app.rep_window);
+	printf("  rep_penalty           : %.2f    (multiplier <1 = penalize repeats)\n", g_app.rep_penalty);
+	printf("  temperature           : %.2f    (0.0 = greedy, 1.0 = neutral, >1.0 = more random)\n", g_app.temperature);
+	printf("  top_k                 : %d      (0 = disabled, higher = more diversity)\n", g_app.top_k);
+	printf("  theme_force_probability : %.2f    (probability to strongly prefer thematic/synonym word)\n", g_app.theme_force_probability);
+	printf("  Average theme density : %.3f\n",g_app.average_theme_density);
+	printf("\n");
 
     // ------------------------------------------------------------------------
     // Candidate Generation
@@ -557,9 +578,7 @@ void display_global_debug(void) {
         printf("  (none generated - check corpus, keywords or parameters)\n");
     printf("\n");
 
-    // ------------------------------------------------------------------------
-    // Freelist / Allocation Stats
-    // ------------------------------------------------------------------------
+    // --- Freelist / Allocation Stats ---
     printf("--- Freelist / Allocation Stats ---\n");
     printf("  entry_freelist        : %p\n", (void *)g_app.entry_freelist);
     printf("  next_freelist         : %p\n", (void *)g_app.next_freelist);
@@ -693,7 +712,6 @@ char *arena_alloc(size_t size) {
     return p;
 }
 
-
 // ------------------------------------------------------------------------
 // Select and Print the Best Candidate
 // ------------------------------------------------------------------------
@@ -701,6 +719,21 @@ static void select_and_print_best(void) {
     if (g_app.candidate_count == 0) {
         fprintf(stderr, "\n[CRITICAL] No valid candidates generated.\n");
         return;
+    }
+
+    // --------------------------------------------------------------------
+    // Archive all candidates
+    // --------------------------------------------------------------------
+    FILE *archive = fopen("archive.txt", "a");  // append mode
+    if (archive) {
+        for (int i = 0; i < g_app.candidate_count; i++) {
+            Candidate *c = &g_app.candidates[i];
+            print_words_properly(archive, c->words, c->length);
+            fputs("\n---\n", archive); // separator between candidates
+        }
+        fclose(archive);
+    } else {
+        fprintf(stderr, "\n[WARNING] Could not open archive.txt for writing.\n");
     }
 
     int best_idx = -1;
@@ -736,6 +769,7 @@ static void select_and_print_best(void) {
     print_words_properly(stdout, winner->words, winner->length);
     putchar('\n');
 }
+
 
 // ------------------------------------------------------------------------
 // Merge Local Hashtable Range into Global Hashtable (Threaded)
@@ -1487,33 +1521,33 @@ static inline bool context_equal(const ContextKey *a, const ContextKey *b) {
 
 // --- Intern a string (returns persistent pointer) ---
 static inline const char *intern(const char *s) {
-    if (!s || !*s) return "";          // empty string shortcut
+    if (!s || !*s) return "";
 
     size_t len = strlen(s);
     uint64_t h = fnv64_hash(s) % g_app.intern_table_size;
 
-    // --- Lookup existing entry ---
+    pthread_mutex_lock(&intern_mutex);
+
     InternEntry *e = g_app.intern_table[h];
     while (e) {
-        if (strcmp(e->str, s) == 0) return e->str;
+        if (strcmp(e->str, s) == 0) {
+            pthread_mutex_unlock(&intern_mutex);
+            return e->str;
+        }
         e = e->next;
     }
 
-    // --- Allocate persistent copy in arena ---
     char *copy = arena_alloc(len + 1);
     memcpy(copy, s, len);
     copy[len] = '\0';
 
-    // --- Add new entry to hash table ---
     InternEntry *new_e = malloc(sizeof(InternEntry));
-    if (!new_e) {
-        fprintf(stderr, "intern: malloc failed\n");
-        exit(1);
-    }
+    if (!new_e) { /* handle error */ }
     new_e->str  = copy;
     new_e->next = g_app.intern_table[h];
     g_app.intern_table[h] = new_e;
 
+    pthread_mutex_unlock(&intern_mutex);
     return copy;
 }
 
@@ -1682,6 +1716,7 @@ int split_into_words(char *line, const char **tokens_out, int max_tokens) {
 // ------------------------------------------------------------------------
 static double compute_perplexity(const char **words, int nw) {
     if (!words || nw < 2) return 1e12;
+    if (g_app.vocab_size <= 0) return 1e12;
 
     double log_sum = 0.0;
     int valid_count = 0;
@@ -1739,8 +1774,10 @@ static double compute_perplexity(const char **words, int nw) {
 
             // Lidstone smoothing probability
             double denom = observed + alpha * g_app.vocab_size;
+            if (denom <= 0) denom = 1.0;
             double p = (observed > 0) ? (match_count + alpha) / denom
                                       : alpha / denom;
+
 
             // Weighted interpolation
             double w = lambdas[ord] * remaining;
@@ -1762,10 +1799,15 @@ static double compute_perplexity(const char **words, int nw) {
         }
     }
 
-    if (valid_count == 0) return 1e12;
+	if (valid_count == 0) return 1e12;
 
-    double avg_log_p = log_sum / valid_count;
-    return exp(-avg_log_p);
+    double avg_log_p = log_sum / (double)valid_count;
+    double perplexity = exp(-avg_log_p);
+
+    // Prevent inf / NaN leaking into scoring
+    if (!isfinite(perplexity) || perplexity < 1e-9) return 1e12;
+
+    return perplexity;
 }
 
 // ------------------------------------------------------------------------
@@ -1892,41 +1934,110 @@ int generate_sequence(const char **out_words)
             next = candidates[best_syn_slot];
         }
 
-        // --- Priority 2: weighted random with repetition penalty ---
-        if (!next) {
-            static const double base_weights[4] = {0.9, 0.7, 0.4, 0.2};
-            double total_w = 0.0;
-            double slot_weights[4] = {0.0};
+        // --- Priority 2: temperature + top-k sampling (replaces old weighted random) ---
+		if (!next) {
+			// Collect valid candidates with their base weights
+			typedef struct {
+				const char *word;
+				double     weight;
+				int        slot;
+			} ScoredCand;
 
-            for (int slot = 0; slot < 4; slot++) {
-                if (!candidates[slot]) continue;
-                double w = base_weights[slot];
+			ScoredCand scored[4];
+			int num_valid = 0;
 
-                // --- repetition penalty ---
-                for (int k = 1; k <= g_app.rep_window && generated - k >= 0; k++) {
-                    if (out_words[generated - k] == candidates[slot]) {
-                        w *= g_app.rep_penalty;
-                        break;
-                    }
-                }
+			static const double base_weights[4] = {0.9, 0.7, 0.4, 0.2};
 
-                slot_weights[slot] = w;
-                total_w += w;
-            }
+			for (int slot = 0; slot < 4; slot++) {
+				if (!candidates[slot]) continue;
 
-            if (total_w > 0.0) {
-                double r = ((double)rand() / RAND_MAX) * total_w;
-                double acc = 0.0;
-                for (int slot = 0; slot < 4; slot++) {
-                    if (!candidates[slot]) continue;
-                    acc += slot_weights[slot];
-                    if (r <= acc) {
-                        next = candidates[slot];
-                        break;
-                    }
-                }
-            }
-        }
+				double w = base_weights[slot];
+
+				// --- repetition penalty ---
+				for (int k = 1; k <= g_app.rep_window && generated - k >= 0; k++) {
+				    if (out_words[generated - k] == candidates[slot]) {
+				        w *= g_app.rep_penalty;
+				        break;
+				    }
+				}
+				
+				// --- extra penalty on common connector bigrams ---
+				if (generated >= 1) {
+					const char *prev = out_words[generated - 1];
+					const char *common_connectors[] = {"the", "and", "of", "to", "in", "a", NULL};
+					
+					for (int c = 0; common_connectors[c]; c++) {
+						if (strcmp(prev, common_connectors[c]) == 0) {
+							// If previous word is "the/and/of/...", penalize repeating the pattern
+							w *= (g_app.rep_penalty * 0.75);  // 25% extra reduction
+							break;
+						}
+					}
+				}
+
+				scored[num_valid].word   = candidates[slot];
+				scored[num_valid].weight = w;
+				scored[num_valid].slot   = slot;
+				num_valid++;
+			}
+
+			if (num_valid == 0) {
+				// nothing to do — will fall through to fallback
+			} else {
+				// 1. Apply temperature (soften or sharpen distribution)
+				double temp_sum = 0.0;
+				double temp_weights[4];
+
+				for (int i = 0; i < num_valid; i++) {
+				    double p = scored[i].weight;
+				    // Avoid log(0) or pow(0, ...)
+				    if (p <= 0) p = 1e-10;
+				    temp_weights[i] = pow(p, 1.0 / g_app.temperature);
+				    temp_sum += temp_weights[i];
+				}
+
+				if (temp_sum > 0) {
+				    for (int i = 0; i < num_valid; i++) {
+				        temp_weights[i] /= temp_sum;
+				    }
+				} else {
+				    // fallback: uniform
+				    for (int i = 0; i < num_valid; i++) {
+				        temp_weights[i] = 1.0 / num_valid;
+				    }
+				}
+
+				// 2. Apply top-k (if enabled and makes sense)
+				int sample_from = num_valid;
+				if (g_app.top_k > 0 && g_app.top_k < num_valid) {
+				    sample_from = g_app.top_k;
+
+				    // Simple sort by temp_weight descending (4 elements → bubble sort is fine)
+				    for (int i = 0; i < sample_from; i++) {
+				        for (int j = i + 1; j < num_valid; j++) {
+				            if (temp_weights[j] > temp_weights[i]) {
+				                // swap
+				                double tw = temp_weights[i]; temp_weights[i] = temp_weights[j]; temp_weights[j] = tw;
+				                ScoredCand tmp = scored[i]; scored[i] = scored[j]; scored[j] = tmp;
+				            }
+				        }
+				    }
+				}
+
+				// 3. Sample from (possibly top-k) distribution
+				double r = (double)rand() / RAND_MAX;
+				double cum = 0.0;
+				next = scored[0].word;  // fallback = first one
+
+				for (int i = 0; i < sample_from; i++) {
+				    cum += temp_weights[i];
+				    if (r <= cum) {
+				        next = scored[i].word;
+				        break;
+				    }
+				}
+			}
+		}
 
         // --- Priority 3: fallback to starter table ---
         if (!next) {
@@ -2049,119 +2160,106 @@ static void print_words_properly(FILE *out, const char **words, int count) {
     }
 }
 
-// --- Free all dynamically allocated model data safely ---
 void free_model(void)
 {
-    // ----------------------------
-    // 1. Free model hashtable + transitions
-    // ----------------------------
-    if (g_app.hashtable) {
-        for (size_t i = 0; i < g_app.hashtable_size; i++) {
-            Entry *e = g_app.hashtable[i];
-            while (e) {
-                Entry *next_entry = e->next;
+    printf("[free_model] Starting cleanup...\n");
 
-                // Free Next chain
-                Next *n = e->nexts;
-                while (n) {
-                    Next *next_n = n->next;
-                    free(n);  // free Next node
-                    n = next_n;
-                }
-
-                free(e);  // free Entry node
-                e = next_entry;
-            }
+    // 1. Candidates (safest first – small arrays)
+    printf("[free_model] Freeing candidates (%d)...\n", g_app.candidate_count);
+    for (int i = 0; i < g_app.candidate_count; i++) {
+        if (g_app.candidates[i].words) {
+            free((void *)g_app.candidates[i].words);
+            g_app.candidates[i].words = NULL;
         }
-        free(g_app.hashtable);
-        g_app.hashtable = NULL;
     }
+    g_app.candidate_count = 0;
+    printf("[free_model] Candidates freed.\n");
 
-    // ----------------------------
-    // 2. Free starter table
-    // ----------------------------
+    // 2. Keyword arrays
+    printf("[free_model] Freeing keywords & thematic starters...\n");
+    if (g_app.keywords) {
+        free(g_app.keywords);
+        g_app.keywords = NULL;
+    }
+    if (g_app.thematic_starters) {
+        free(g_app.thematic_starters);
+        g_app.thematic_starters = NULL;
+    }
+    printf("[free_model] Keywords & thematic freed.\n");
+
+    // 3. Starter table – these were malloc/calloc'ed
     if (g_app.starter_table) {
+        printf("[free_model] Freeing starter_table (%zu buckets)...\n", g_app.starter_table_size);
         for (size_t i = 0; i < g_app.starter_table_size; i++) {
             Starter *s = g_app.starter_table[i];
             while (s) {
                 Starter *next_s = s->next;
-                free(s);  // free node only; string is interned
+                free(s);
                 s = next_s;
             }
         }
         free(g_app.starter_table);
         g_app.starter_table = NULL;
+        printf("[free_model] Starter table freed.\n");
     }
 
-    // ----------------------------
-    // 3. Free intern table
-    // ----------------------------
+    // 4. Intern table – InternEntry nodes were malloc'ed
     if (g_app.intern_table) {
+        printf("[free_model] Freeing intern_table (%zu buckets)...\n", g_app.intern_table_size);
         for (size_t i = 0; i < g_app.intern_table_size; i++) {
             InternEntry *e = g_app.intern_table[i];
             while (e) {
                 InternEntry *next_e = e->next;
-                free(e);  // free entry, not string
+                free(e);
                 e = next_e;
             }
         }
         free(g_app.intern_table);
         g_app.intern_table = NULL;
+        printf("[free_model] Intern table freed.\n");
     }
 
-    // ----------------------------
-    // 4. Free arena blocks (all strings live here)
-    // ----------------------------
-    ArenaBlock *block = g_app.arena_head;
-    while (block) {
-        ArenaBlock *next_block = block->next;
-        free(block);
-        block = next_block;
-    }
-    g_app.arena_head    = NULL;
-    g_app.arena_current = NULL;
+    // 5. IMPORTANT: Arena blocks contain strings + many Entry/Next nodes
+    //    We free whole blocks → do NOT free individual Entry/Next anymore!
+    if (g_app.arena_head) {
+        printf("[free_model] Freeing arena (%zu bytes used, %zu blocks)...\n",
+               g_app.arena_total_bytes_used, g_app.arena_block_count);
 
-    // ----------------------------
-    // 5. Free candidate arrays
-    // ----------------------------
-    for (int i = 0; i < g_app.candidate_count; i++) {
-        if (g_app.candidates[i].words) {
-            free(g_app.candidates[i].words);
-            g_app.candidates[i].words = NULL;
+        ArenaBlock *block = g_app.arena_head;
+        size_t block_count = 0;
+        while (block) {
+            ArenaBlock *next = block->next;
+            free(block);
+            block = next;
+            block_count++;
+            if (block_count % 10 == 0) {
+                printf("[free_model] Freed %zu arena blocks...\n", block_count);
+            }
         }
+        g_app.arena_head = NULL;
+        g_app.arena_current = NULL;
+        printf("[free_model] Arena fully freed (%zu blocks).\n", block_count);
     }
-    g_app.candidate_count = 0;
+
+    // 6. hashtable array itself (but NOT the Entries – they live in arena!)
+    if (g_app.hashtable) {
+        printf("[free_model] Freeing hashtable array pointer only...\n");
+        free(g_app.hashtable);
+        g_app.hashtable = NULL;
+        printf("[free_model] Hashtable array freed.\n");
+    }
+
+    // 7. Reset stats & freelists
+    printf("[free_model] Resetting stats & freelists...\n");
+    g_app.vocab_size     = 0;
+    g_app.total_starters = 0;
+    g_app.entry_freelist = NULL;
+    g_app.next_freelist  = NULL;
     g_app.best_candidate_index = -1;
     g_app.best_score = 0.0;
     g_app.generation_attempts = 0;
 
-    // ----------------------------
-    // 6. Free keyword-related dynamic arrays
-    // ----------------------------
-    if (g_app.keywords) {
-        free(g_app.keywords);
-        g_app.keywords = NULL;
-    }
-    g_app.keyword_count = 0;
-
-    if (g_app.thematic_starters) {
-        free(g_app.thematic_starters);
-        g_app.thematic_starters = NULL;
-    }
-    g_app.thematic_starter_count = 0;
-    g_app.total_thematic_weight = 0;
-
-    // ----------------------------
-    // 7. Reset freelists (just in case)
-    // ----------------------------
-    g_app.entry_freelist = NULL;
-    g_app.next_freelist  = NULL;
-
-    // ----------------------------
-    // 8. Reset model stats
-    // ----------------------------
-    g_app.vocab_size     = 0;
-    g_app.total_starters = 0;
+    printf("[free_model] Cleanup finished successfully.\n");
 }
 
 
@@ -2302,31 +2400,24 @@ int main(int argc, char **argv)
     // ----------------------------
     if (g_app.verbose >= 1) {
         display_global_debug();
-        // display_candidates();  // Not needed currently
+        //display_candidates();  // Not needed currently
     }
 
 shutdown:
-    // ----------------------------
-    // Cleanup
-    // ----------------------------
-    //free_model();
+    // --- Cleanup ---
+    free_model();
     return 0;
 }
 
 static double score_candidate(const char **words, int nw)
 {
-    if (nw < g_app.min_gen_len) return 1e15;  // too short → very bad
+    if (nw < g_app.min_gen_len) return 1e15;
 
-    // ----------------------------
-    // 1. Theme / synonym density (biggest factor)
-    // ----------------------------
-    int theme_count = 0;
-    int exact_keyword_count = 0;
-
+    // 1. Theme density
+    int theme_count = 0, exact_keyword_count = 0;
     for (int i = 0; i < nw; i++) {
         if (is_keyword_related(words[i])) {
             theme_count++;
-            // Extra bonus for exact keyword match
             for (int k = 0; k < g_app.keyword_count; k++) {
                 if (words[i] == g_app.keywords[k]) {
                     exact_keyword_count++;
@@ -2335,62 +2426,41 @@ static double score_candidate(const char **words, int nw)
             }
         }
     }
-
     double theme_ratio = (double)theme_count / nw;
-    double theme_score = 30.0 * (1.0 - theme_ratio);  // higher weight for low theme → penalize
-    double exact_bonus = exact_keyword_count * 0.5;   // reward exact keywords
+    double theme_score = 8.0 * (1.0 - theme_ratio);  // reduced from 30
 
-    // ----------------------------
-    // 2. Repetition penalty (local + global)
-    // ----------------------------
+    double exact_bonus = exact_keyword_count * 0.5;
+
+    // 2. Repetition
     int local_rep = 0;
     for (int j = 2; j < nw; j++) {
-        // Bigram alternation penalty
-        if (words[j] == words[j-2] && words[j-1] == words[j+1]) {
-            local_rep++;
-        }
+        if (words[j] == words[j-2] && words[j-1] == words[j+1]) local_rep++;
     }
-
     int global_rep = 0;
     for (int i = 0; i < nw - 2; i++) {
         for (int j = i + 3; j < nw - 2; j++) {
-            if (words[i] == words[j] &&
-                words[i+1] == words[j+1] &&
-                words[i+2] == words[j+2]) {
+            if (words[i] == words[j] && words[i+1] == words[j+1] && words[i+2] == words[j+2])
                 global_rep++;
-            }
         }
     }
+    double rep_penalty = 1.0 + 1.0 * local_rep + 2.0 * global_rep;
 
-    double rep_penalty = 1.0 + 0.5 * local_rep + 1.0 * global_rep;
-
-    // ----------------------------
-    // 3. Perplexity (fluency under Markov model)
-    // ----------------------------
+    // 3. Perplexity (normalized)
     double ppl = compute_perplexity(words, nw);
+    double norm_ppl = ppl / 100.0;  // adjust divisor to taste (50–200)
 
-    // ----------------------------
-    // 4. Length reward (encourage good length)
-    // ----------------------------
+    // 4. Length reward
     double ideal_len = (g_app.min_gen_len + g_app.max_gen_len) / 2.0;
     double len_diff = fabs(nw - ideal_len);
-    double len_reward = 1.0 + 0.8 * exp(-len_diff / 5.0);  // Gaussian-like
+    double len_reward = 1.0 + 0.8 * exp(-len_diff / 5.0);
 
-    // Bonus if ends with sentence punctuation
     double end_bonus = 0.0;
-    if (nw > 0) {
-        const char *last = words[nw-1];
-        if (strcmp(last, ".") == 0 || strcmp(last, "!") == 0 || strcmp(last, "?") == 0) {
-            end_bonus = 0.7;
-        }
-    }
+    if (nw > 0 && (strcmp(words[nw-1], ".") == 0 || strcmp(words[nw-1], "!") == 0 || strcmp(words[nw-1], "?") == 0))
+        end_bonus = 0.7;
 
-    // ----------------------------
-    // Final composite score (lower = better)
-    // ----------------------------
-    double final_score = 
-        (ppl * rep_penalty * theme_score) /   // bad fluency + rep + low theme → high score
-        (len_reward + end_bonus + exact_bonus + 0.1);  // good length + ending + exact keywords → lower score
+    // Final score
+    double final_score = (norm_ppl * rep_penalty * theme_score) /
+                         (len_reward + end_bonus + exact_bonus + 0.5);
 
     return final_score;
 }
@@ -2398,30 +2468,49 @@ static double score_candidate(const char **words, int nw)
 static void generate_multiple_candidates(void) {
     g_app.candidate_count = 0;
     g_app.generation_attempts = 0;
+    g_app.average_theme_density = 0.0;
+    double theme_density_sum = 0.0;
+
     const int max_attempts = g_app.max_candidates * 10;
+    const double MIN_THEME_DENSITY = g_app.min_theme_density > 0 ? g_app.min_theme_density : 0;
 
     while (g_app.candidate_count < g_app.max_candidates &&
-           g_app.generation_attempts < max_attempts) 
+           g_app.generation_attempts < max_attempts)
     {
         g_app.generation_attempts++;
         const char *words[MAX_WORDS_PER_GENERATION + 16] = {0};
         int nw = generate_sequence(words);
 
-        if (nw < g_app.min_gen_len || nw > g_app.max_gen_len) continue;
+        if (nw < g_app.min_gen_len || nw > g_app.max_gen_len) {
+            continue;
+        }
+
+        // Compute density (even if filter is off)
+        int theme_count = 0;
+        for (int i = 0; i < nw; i++) {
+            if (is_keyword_related(words[i])) theme_count++;
+        }
+        double density = nw > 0 ? (double)theme_count / nw : 0.0;
+
+        // Density filter (disabled)
+        if (density < MIN_THEME_DENSITY) {
+            continue;
+        }
 
         const char **copy = malloc(nw * sizeof(const char *));
         if (!copy) continue;
-
         memcpy(copy, words, nw * sizeof(const char *));
+
         Candidate *c = &g_app.candidates[g_app.candidate_count];
         c->words = copy;
         c->length = nw;
         g_app.candidate_count++;
 
-        if (g_app.verbose >= 2) {
-            printf("Valid candidate #%d added (length %d after %d attempts)\n",
-                   g_app.candidate_count, nw, g_app.generation_attempts);
-        }
+        theme_density_sum += density;
+    }
+
+    if (g_app.candidate_count > 0) {
+        g_app.average_theme_density = theme_density_sum / g_app.candidate_count;
     }
 
     if (g_app.candidate_count == 0) {
