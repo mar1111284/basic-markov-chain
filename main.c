@@ -340,13 +340,13 @@ static int app_init(void)
     g_app.min_gen_len     = DEFAULT_MIN_TEXT_LENGTH;
     g_app.max_gen_len     = DEFAULT_MAX_TEXT_LENGTH;
     g_app.max_candidates  = MAX_CANDIDATES;
-	g_app.temperature = 1.3;
-	g_app.top_k = 10;
-	g_app.rep_penalty = 0.18;
+	g_app.temperature = 1.2;
+	g_app.top_k = 8;
+	g_app.rep_penalty = 0.15;
 	g_app.rep_window              = 10;       // 8–16 is fine
-	g_app.theme_force_probability  = 0.8;     // lower = less forced jumps
+	g_app.theme_force_probability  = 0.4;     // lower = less forced jumps
 	g_app.average_theme_density = 0.0;
-	g_app.min_theme_density = 0.04;
+	g_app.min_theme_density = 0.05;
 
 
     // ------------------------------------------------------------
