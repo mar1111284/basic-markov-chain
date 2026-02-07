@@ -1,0 +1,18 @@
+# .clang-format
+# Style for C code - clean, consistent, Fedora-friendly
+
+BasedOnStyle: LLVM       # Start from LLVM style (popular, clean)
+IndentWidth: 4           # 4 spaces per indent
+TabWidth: 4              # tab width for alignment
+UseTab: Never            # use spaces, not tabs
+BreakBeforeBraces: Allman # brace on new line style
+AllowShortFunctionsOnASingleLine: false
+ColumnLimit: 80          # wrap lines longer than 80 chars
+PointerAlignment: Left   # int* ptr vs int *ptr style
+DerivePointerAlignment: false
+SpaceAfterCStyleCast: true
+SpacesInParentheses: false
+SpaceBeforeParens: ControlStatements # for if, for, while
+IndentCaseLabels: true   # indent switch/case nicely
+SortIncludes: false      # do not auto-sort includes
+
